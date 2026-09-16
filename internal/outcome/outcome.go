@@ -111,6 +111,69 @@ func recordFor(s *store.Store, actionID string, objectivePathID sql.NullString, 
 	return outcomeID, nil
 }
 
+// RecordManualResult registra el resultado de una acción resuelta a mano por
+// el operador (`exitone resolve <action> --result fail|success`), sin
+// archivo de evidencia de por medio (así que no hay IngestResult que medir).
+// Fase 3 del plan de arquitectura: esto reemplaza lo que antes hacía
+// hypothesis.RecordResult, que forzaba crear una HYPOTHESIS nueva en cada
+// intento SSH solo para poder registrar el resultado. La cobertura real
+// (qué identidades ya se probaron contra qué servicio) ya la refleja
+// directamente la tabla `candidate` (ver internal/strategy/ssh.go:
+// candidateExists) — no hace falta el ciclo hypothesis→close→reopen para
+// saber "qué falta probar", que es justo la confusión que producía la
+// anomalía real encontrada (una hipótesis vieja podía quedar 'reopened' sin
+// relación con la identidad que en realidad causaba el gap).
+func RecordManualResult(s *store.Store, actionIDPrefix, result string) (actionID string, err error) {
+	if result != "fail" && result != "success" {
+		return "", fmt.Errorf("result debe ser 'fail' o 'success', recibido %q", result)
+	}
+
+	var objectivePathID sql.NullString
+	err = s.DB.QueryRow(
+		`SELECT id, objective_path_id FROM action WHERE id LIKE ? || '%' ORDER BY executed_at DESC LIMIT 1`,
+		actionIDPrefix,
+	).Scan(&actionID, &objectivePathID)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("no se encontró una acción con prefijo %q", actionIDPrefix)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	gain := 0.1
+	pathResolved := false
+	if result == "success" {
+		gain = 0.9
+		pathResolved = true // éxito resuelve directamente el path que motivó el intento
+	}
+
+	outcomeID := uuid.NewString()
+	if _, err := s.DB.Exec(`
+		INSERT INTO outcome(id, action_id, new_entities, new_relationships, hypotheses_confirmed,
+			hypotheses_refuted, contradictions_resolved, computed_information_gain, recorded_at)
+		VALUES (?, ?, 0, 0, 0, 0, 0, ?, ?)`,
+		outcomeID, actionID, gain, now,
+	); err != nil {
+		return "", fmt.Errorf("insert outcome: %w", err)
+	}
+	if _, err := s.DB.Exec(`UPDATE action SET status = 'resolved' WHERE id = ?`, actionID); err != nil {
+		return "", fmt.Errorf("mark action resolved: %w", err)
+	}
+	if pathResolved && objectivePathID.Valid {
+		if _, err := s.DB.Exec(`UPDATE objective_path SET status = 'answered' WHERE id = ?`, objectivePathID.String); err != nil {
+			return "", fmt.Errorf("mark path answered: %w", err)
+		}
+		var objectiveID string
+		if err := s.DB.QueryRow(`SELECT objective_id FROM objective_path WHERE id = ?`, objectivePathID.String).Scan(&objectiveID); err == nil {
+			if _, err := s.DB.Exec(`UPDATE methodology_objective SET status = 'answered' WHERE id = ?`, objectiveID); err != nil {
+				return "", fmt.Errorf("mark objective answered: %w", err)
+			}
+		}
+	}
+	return actionID, nil
+}
+
 func clamp01(v float64) float64 {
 	if v < 0 {
 		return 0

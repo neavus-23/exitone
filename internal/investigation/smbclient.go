@@ -16,7 +16,7 @@ import (
 // MEMBER_OF desde el host, y una entidad share por cada share con relación
 // HAS_SHARE. Esto es lo que habilita la correlación cross-tool de Slice 2
 // (sección L): SMB -> domain -> nuevo methodology objective.
-func IngestSmbclient(s *store.Store, sessionID, rawOutputRef, host string, listing parsers.SmbclientListing) (*IngestResult, error) {
+func IngestSmbclient(s *store.Store, sessionID, rawOutputRef, eventID, host string, listing parsers.SmbclientListing) (*IngestResult, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res := &IngestResult{}
 
@@ -29,8 +29,8 @@ func IngestSmbclient(s *store.Store, sessionID, rawOutputRef, host string, listi
 	evidenceID := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO evidence(id, event_id, raw_output_ref, tool_name, parse_level, created_at)
-		 VALUES (?, NULL, ?, 'smbclient', 1, ?)`,
-		evidenceID, rawOutputRef, now,
+		 VALUES (?, ?, ?, 'smbclient', 1, ?)`,
+		evidenceID, nullableString(eventID), rawOutputRef, now,
 	); err != nil {
 		return nil, fmt.Errorf("insert evidence: %w", err)
 	}

@@ -82,7 +82,7 @@ func GenerateEndpointFollowupCandidates(s *store.Store, sessionID string, newEnt
 			UncertaintyReduction: 0.6,
 			RedundancyPenalty:    0,
 		}
-		score := terms.Score()
+		score := terms.UtilityScore()
 
 		explanation := fmt.Sprintf(
 			"Endpoint %q contiene la palabra clave %q (posible panel de administración/backup/config expuesto).\n"+

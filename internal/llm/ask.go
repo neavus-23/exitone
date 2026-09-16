@@ -3,7 +3,9 @@ package llm
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"exitone/internal/store"
@@ -25,6 +27,12 @@ Reglas estrictas de prioridad:
   CONTEXTO ENFOCADO; ese cálculo ya se hizo en Go, tu trabajo es solo redactarlo.
 - Si ninguna sección responde la pregunta, di explícitamente que no tienes esa información — nunca inventes ni asumas.
 - No sugieras próximas acciones nuevas (para eso existe 'exitone next'); solo explica lo que YA se sabe/hizo.
+- Cada entidad lista su propio "state" explícitamente (open/closed) — cuando menciones el estado de
+  un puerto/servicio, cópialo LITERAL del "state=" de ESA entidad exacta. Nunca generalices el
+  estado de un servicio a otro solo porque aparecen en la misma lista o el mismo host — cada uno
+  tiene su propio state y hay que citarlo por separado.
+- Si el operador no preguntó por el estado de un puerto en particular, no lo menciones — reduce la
+  oportunidad de mezclar el estado de un servicio con el de otro que no viene al caso.
 - Sé conciso. Responde en español.`
 
 // BuildContextSummary arma el contexto que se le pasa al LLM: una vista
@@ -38,15 +46,15 @@ func BuildContextSummary(s *store.Store, sessionID string) (string, error) {
 	s.DB.QueryRow(`SELECT target_label FROM session WHERE id = ?`, sessionID).Scan(&label)
 	fmt.Fprintf(&b, "SESIÓN: target=%s\n\n", label)
 
-	b.WriteString("ENTIDADES CONOCIDAS:\n")
+	b.WriteString("ENTIDADES CONOCIDAS (cada línea es una entidad — su \"state\", si aparece, es SOLO de ESA línea):\n")
 	rows, err := s.DB.Query(`SELECT type, canonical_value, attrs FROM entity WHERE session_id = ? ORDER BY type, canonical_value`, sessionID)
 	if err != nil {
 		return "", err
 	}
 	for rows.Next() {
-		var t, v, attrs string
-		rows.Scan(&t, &v, &attrs)
-		fmt.Fprintf(&b, "- [%s] %s %s\n", t, v, attrs)
+		var t, v, attrsJSON string
+		rows.Scan(&t, &v, &attrsJSON)
+		fmt.Fprintf(&b, "- [%s] %s (%s)\n", t, v, formatAttrsForLLM(attrsJSON))
 	}
 	rows.Close()
 
@@ -144,6 +152,35 @@ func BuildContextSummary(s *store.Store, sessionID string) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+// formatAttrsForLLM aplana el JSON crudo de attrs a "key=value" — un modelo
+// de 3B leyendo `{"port":3000,...}` junto a nueve líneas casi idénticas
+// tiende a mezclar el "state" de una entidad con el de la siguiente (bug
+// real observado: reportó 3306/tcp como cerrado por contagio del 3000/tcp
+// vecino, que sí lo está). "state" siempre va primero y en mayúsculas para
+// que sea imposible de saltarse al leer la línea.
+func formatAttrsForLLM(attrsJSON string) string {
+	var attrs map[string]any
+	if err := json.Unmarshal([]byte(attrsJSON), &attrs); err != nil || len(attrs) == 0 {
+		return "sin atributos"
+	}
+
+	var parts []string
+	if state, ok := attrs["state"]; ok {
+		parts = append(parts, fmt.Sprintf("state=%s", strings.ToUpper(fmt.Sprintf("%v", state))))
+		delete(attrs, "state")
+	}
+
+	var keys []string
+	for k := range attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, attrs[k]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // computeDerivedFacts pre-correlaciona en Go las preguntas que en la prueba

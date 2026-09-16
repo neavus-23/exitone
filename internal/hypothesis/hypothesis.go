@@ -1,13 +1,16 @@
-// Package hypothesis registra el resultado de una ACTION de tipo
-// test_ssh_auth: crea (o reutiliza) una HYPOTHESIS y la cierra/confirma,
-// dejando un OUTCOME. Es el punto donde una conclusión entra al dominio y
-// queda disponible para que internal/temporal decida más adelante si debe
-// reabrirse.
+// Package hypothesis implementa el motor de hipótesis rediseñado (Fase 3 del
+// plan de arquitectura): `hypothesis` significa exactamente una proposición
+// falsable, con evidencia a favor/en contra al nivel correcto (una
+// Observation concreta, no un Evidence completo) y un estado categórico —
+// nunca una fuerza inventada por conteo. La reapertura queda reservada para
+// el caso genuino: una observation 'contradicts' que llega DESPUÉS de un
+// cierre CONFIRMED/REFUTED — no "apareció una entidad nueva de cierto tipo",
+// que es lo que el diseño anterior (generalizar el diff de conjuntos de
+// internal/temporal) confundía.
 package hypothesis
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -16,92 +19,157 @@ import (
 	"github.com/google/uuid"
 )
 
-// RecordResult cierra la acción identificada por actionIDPrefix con el
-// resultado de la prueba SSH: crea la HYPOTHESIS, la vincula vía
-// action_hypothesis (relation_kind=TESTED), y persiste el OUTCOME.
-func RecordResult(s *store.Store, sessionID, actionIDPrefix, result string) (hypothesisID string, err error) {
-	if result != "fail" && result != "success" {
-		return "", fmt.Errorf("result debe ser 'fail' o 'success', recibido %q", result)
-	}
+type Status string
 
-	var actionID, candidateID string
-	err = s.DB.QueryRow(
-		`SELECT id, candidate_id FROM action WHERE id LIKE ? || '%' ORDER BY executed_at DESC LIMIT 1`,
-		actionIDPrefix,
-	).Scan(&actionID, &candidateID)
-	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("no se encontró una acción con prefijo %q", actionIDPrefix)
-	}
-	if err != nil {
-		return "", err
-	}
+const (
+	Untested  Status = "untested"
+	Supported Status = "supported"
+	Disputed  Status = "disputed"
+	Refuted   Status = "refuted"
+	Confirmed Status = "confirmed"
+	Reopened  Status = "reopened"
+)
 
-	var paramsJSON string
-	if err := s.DB.QueryRow(`SELECT parameters FROM candidate WHERE id = ?`, candidateID).Scan(&paramsJSON); err != nil {
-		return "", err
-	}
-	var params struct {
-		ServiceEntityID string `json:"service_entity_id"`
-		Identity        struct {
-			Value string `json:"value"`
-		} `json:"identity"`
-	}
-	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
-		return "", fmt.Errorf("parsear parámetros del candidato: %w", err)
-	}
-	if params.ServiceEntityID == "" {
-		return "", fmt.Errorf("el candidato de esta acción no es de tipo test_ssh_auth (sin service_entity_id)")
-	}
+// Explanation es la respuesta a `why <hypothesis-id>`: conteos crudos y un
+// status categórico, nunca una fuerza derivada ("alta/media/baja") — dos
+// observaciones del mismo escaneo no son dos fuentes independientes, así que
+// no se inflan a una confianza que el sistema no puede respaldar todavía.
+type Explanation struct {
+	Statement              string
+	Status                 Status
+	SupportingObservations int
+	ContradictingObservations int
+}
 
+// Open crea una hipótesis nueva en estado UNTESTED — el único punto de
+// entrada al ciclo de vida. subjectEntityID ancla la hipótesis a la entidad
+// sobre la que trata (ej. el service SMB al que aplica).
+func Open(s *store.Store, sessionID, subjectEntityID, statement string) (string, error) {
+	id := uuid.NewString()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	status := "closed"
-	hypConfirmed, hypRefuted := 0, 0
-	if result == "success" {
-		status = "confirmed"
-		hypConfirmed = 1
-	} else {
-		hypRefuted = 1
-	}
-
-	hypID := uuid.NewString()
-	statement := fmt.Sprintf("Autenticación SSH investigada para el servicio (identidad probada: %s)", params.Identity.Value)
 	if _, err := s.DB.Exec(
-		`INSERT INTO hypothesis(id, session_id, statement, subject_entity_id, status, confidence, opened_at, closed_at)
-		 VALUES (?, ?, ?, ?, ?, 1.0, ?, ?)`,
-		hypID, sessionID, statement, params.ServiceEntityID, status, now, now,
+		`INSERT INTO hypothesis(id, session_id, statement, subject_entity_id, status, opened_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, sessionID, statement, subjectEntityID, string(Untested), now,
 	); err != nil {
 		return "", fmt.Errorf("insert hypothesis: %w", err)
 	}
+	return id, nil
+}
 
+// Support vincula una Observation como evidencia A FAVOR. Si la hipótesis ya
+// estaba cerrada (CONFIRMED/REFUTED), un soporte adicional NO la reabre —
+// solo una contradicción reabre un cierre (ver Contradict). En cualquier
+// otro estado, el status se recalcula por presencia/ausencia de evidencia en
+// cada sentido, nunca por cantidad.
+func Support(s *store.Store, hypothesisID, observationID string) error {
+	return link(s, hypothesisID, observationID, "supports")
+}
+
+// Contradict vincula una Observation como evidencia EN CONTRA. Si la
+// hipótesis estaba CONFIRMED o REFUTED, esta es la reapertura genuina: nueva
+// evidencia contradice específicamente un cierre anterior → REOPENED.
+func Contradict(s *store.Store, hypothesisID, observationID string) error {
+	return link(s, hypothesisID, observationID, "contradicts")
+}
+
+func link(s *store.Store, hypothesisID, observationID, relation string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := s.DB.Exec(
-		`INSERT INTO action_hypothesis(action_id, hypothesis_id, relation_kind) VALUES (?, ?, 'TESTED')`,
-		actionID, hypID,
+		`INSERT INTO hypothesis_observation(hypothesis_id, observation_id, relation, created_at) VALUES (?, ?, ?, ?)`,
+		hypothesisID, observationID, relation, now,
 	); err != nil {
-		return "", fmt.Errorf("insert action_hypothesis: %w", err)
+		return fmt.Errorf("insert hypothesis_observation: %w", err)
+	}
+	return recomputeStatus(s, hypothesisID, relation)
+}
+
+func recomputeStatus(s *store.Store, hypothesisID, newRelation string) error {
+	var current string
+	if err := s.DB.QueryRow(`SELECT status FROM hypothesis WHERE id = ?`, hypothesisID).Scan(&current); err != nil {
+		return err
 	}
 
-	outID := uuid.NewString()
-	gain := 0.1
-	if result == "success" {
-		gain = 0.9
+	// Reapertura genuina (sección J3): una contradicción que llega DESPUÉS
+	// de un cierre explícito — no se recalcula por conteo, se marca REOPENED
+	// directamente y se sale, preservando que fue un cierre el que se reabrió.
+	if newRelation == "contradicts" && (Status(current) == Confirmed || Status(current) == Refuted) {
+		_, err := s.DB.Exec(`UPDATE hypothesis SET status = ? WHERE id = ?`, string(Reopened), hypothesisID)
+		return err
 	}
-	if _, err := s.DB.Exec(`
-		INSERT INTO outcome(id, action_id, new_entities, new_relationships, hypotheses_confirmed,
-			hypotheses_refuted, contradictions_resolved, computed_information_gain, recorded_at)
-		VALUES (?, ?, 0, 0, ?, ?, 0, ?, ?)`,
-		outID, actionID, hypConfirmed, hypRefuted, gain, now,
-	); err != nil {
-		return "", fmt.Errorf("insert outcome: %w", err)
-	}
-
-	// Bug real encontrado revisando el contexto de `exitone ask`: sin esto, la
-	// acción quedaba 'awaiting_evidence' para siempre después de resolverse
-	// con `exitone resolve`, arriesgando que outcome.AutoRecordPending la
-	// volviera a emparejar incorrectamente con una ingesta posterior de la
-	// misma herramienta (ssh) que en realidad correspondía a otra acción.
-	if _, err := s.DB.Exec(`UPDATE action SET status = 'resolved' WHERE id = ?`, actionID); err != nil {
-		return "", fmt.Errorf("mark action resolved: %w", err)
+	// CONFIRMED es un cierre explícito (ver Confirm) — un soporte adicional
+	// no lo cambia ni lo recalcula.
+	if Status(current) == Confirmed {
+		return nil
 	}
 
-	return hypID, nil
+	var supports, contradicts int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM hypothesis_observation WHERE hypothesis_id = ? AND relation = 'supports'`, hypothesisID).Scan(&supports); err != nil {
+		return err
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM hypothesis_observation WHERE hypothesis_id = ? AND relation = 'contradicts'`, hypothesisID).Scan(&contradicts); err != nil {
+		return err
+	}
+
+	var next Status
+	switch {
+	case supports > 0 && contradicts > 0:
+		next = Disputed
+	case contradicts > 0:
+		next = Refuted
+	case supports > 0:
+		next = Supported
+	default:
+		next = Untested
+	}
+	_, err := s.DB.Exec(`UPDATE hypothesis SET status = ? WHERE id = ?`, string(next), hypothesisID)
+	return err
+}
+
+// Confirm es un cierre EXPLÍCITO (nunca automático por conteo) — el llamador
+// decide que la evidencia acumulada es concluyente. Solo esto (o Refute)
+// deja una hipótesis en un estado del que una contradicción futura la
+// reabre genuinamente.
+func Confirm(s *store.Store, hypothesisID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.DB.Exec(`UPDATE hypothesis SET status = ?, closed_at = ? WHERE id = ?`, string(Confirmed), now, hypothesisID)
+	return err
+}
+
+// Refute es el cierre explícito equivalente a Confirm, para cuando la
+// evidencia concluyente va en contra de la proposición.
+func Refute(s *store.Store, hypothesisID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.DB.Exec(`UPDATE hypothesis SET status = ?, closed_at = ? WHERE id = ?`, string(Refuted), now, hypothesisID)
+	return err
+}
+
+// Explain responde `why <hypothesis-id>`: statement + conteos crudos +
+// status categórico — nunca una fuerza inventada.
+func Explain(s *store.Store, hypothesisIDPrefix string) (*Explanation, error) {
+	var id, statement, status string
+	err := s.DB.QueryRow(
+		`SELECT id, statement, status FROM hypothesis WHERE id LIKE ? || '%' ORDER BY opened_at DESC LIMIT 1`,
+		hypothesisIDPrefix,
+	).Scan(&id, &statement, &status)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no se encontró una hipótesis con prefijo %q", hypothesisIDPrefix)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var supports, contradicts int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM hypothesis_observation WHERE hypothesis_id = ? AND relation = 'supports'`, id).Scan(&supports); err != nil {
+		return nil, err
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM hypothesis_observation WHERE hypothesis_id = ? AND relation = 'contradicts'`, id).Scan(&contradicts); err != nil {
+		return nil, err
+	}
+
+	return &Explanation{
+		Statement:                 statement,
+		Status:                    Status(status),
+		SupportingObservations:    supports,
+		ContradictingObservations: contradicts,
+	}, nil
 }

@@ -9,7 +9,6 @@ import (
 	"exitone/internal/commandengine"
 	"exitone/internal/debuglog"
 	"exitone/internal/store"
-	"exitone/internal/temporal"
 
 	"github.com/google/uuid"
 )
@@ -41,36 +40,22 @@ func candidateExists(s *store.Store, sessionID, serviceEntityID, identityEntityI
 	return count > 0, err
 }
 
-// GenerateSSHAuthCandidates cubre dos fuentes del Candidate Generator (G1):
-//   - "methodology": un candidato por cada identidad conocida aún no probada
-//     contra un servicio SSH con el objective_path 'credential_test' abierto.
-//   - "reopening": un candidato por cada identidad en el gap de una hipótesis
-//     'reopened' (sección D1) — el caso central de Slice 3.
+// GenerateSSHAuthCandidates cubre la fuente "methodology" del Candidate
+// Generator (G1): un candidato por cada identidad conocida aún no probada
+// contra un servicio SSH con el objective_path 'credential_test' abierto.
+//
+// Fase 3 del plan de arquitectura: antes existía una segunda fuente
+// ("reopening") que generaba un candidato equivalente cuando una hipótesis
+// SSH pasaba a 'reopened' vía diff de conjuntos de identidades — se retiró
+// porque era exactamente el mismo candidato que este generador ya produce
+// para cualquier identidad nueva sin necesitar ninguna hipótesis de por
+// medio: candidateExists() deduplica por (servicio, identidad) directamente
+// contra la tabla `candidate`, que ya ES la cobertura real. La reapertura de
+// hipótesis (internal/hypothesis.Contradict) queda reservada para cuando
+// evidencia nueva contradiga específicamente un cierre previo — un concepto
+// distinto de "hay una identidad más por probar".
 func GenerateSSHAuthCandidates(s *store.Store, sessionID string) ([]string, error) {
-	var created []string
-
-	// El orden importa: la reapertura se genera PRIMERO. Para una identidad
-	// que es simultáneamente "nueva y no probada" y "parte del gap de una
-	// hipótesis reabierta" (el caso exacto de Slice 3), queremos que el
-	// candidato resultante lleve la explicación estructural de reapertura
-	// (source='reopening', hypothesis_impact alto) y no un candidato
-	// genérico de metodología indistinguible de cualquier otro. El dedup
-	// por (servicio, identidad) en candidateExists hace que, una vez creado
-	// el candidato de reapertura, el generador de metodología lo detecte y
-	// no duplique.
-	reopenCandidates, err := generateSSHReopeningCandidates(s, sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("generate ssh reopening candidates: %w", err)
-	}
-	created = append(created, reopenCandidates...)
-
-	methCandidates, err := generateSSHMethodologyCandidates(s, sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("generate ssh methodology candidates: %w", err)
-	}
-	created = append(created, methCandidates...)
-
-	return created, nil
+	return generateSSHMethodologyCandidates(s, sessionID)
 }
 
 func generateSSHMethodologyCandidates(s *store.Store, sessionID string) ([]string, error) {
@@ -138,54 +123,6 @@ func generateSSHMethodologyCandidates(s *store.Store, sessionID string) ([]strin
 	return created, nil
 }
 
-func generateSSHReopeningCandidates(s *store.Store, sessionID string) ([]string, error) {
-	rows, err := s.DB.Query(`SELECT id, subject_entity_id, statement FROM hypothesis WHERE session_id = ? AND status = 'reopened'`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	type hr struct{ id, subjectEntityID, statement string }
-	var hyps []hr
-	for rows.Next() {
-		var h hr
-		if err := rows.Scan(&h.id, &h.subjectEntityID, &h.statement); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		hyps = append(hyps, h)
-	}
-	rows.Close()
-
-	var created []string
-	for _, h := range hyps {
-		gap, err := temporal.GapEntitiesFor(s, h.id)
-		if err != nil {
-			return nil, err
-		}
-		host, err := resolveHostForService(s, h.subjectEntityID)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, g := range gap {
-			exists, err := candidateExists(s, sessionID, h.subjectEntityID, g.ID)
-			if err != nil {
-				return nil, err
-			}
-			if exists {
-				continue
-			}
-			id, err := insertSSHCandidate(s, sessionID, "reopening", nil, &h.id, h.subjectEntityID, g.ID, g.Value, host)
-			if err != nil {
-				return nil, err
-			}
-			created = append(created, id)
-		}
-	}
-	return created, nil
-}
-
 func insertSSHCandidate(s *store.Store, sessionID, source string, objectivePathID, hypothesisID *string, serviceEntityID, identityEntityID, identityValue, host string) (string, error) {
 	rendered := commandengine.RenderSSHAuthTest(
 		commandengine.Slot{Value: identityValue, Provenance: "confirmed"},
@@ -226,7 +163,7 @@ func insertSSHCandidate(s *store.Store, sessionID, source string, objectivePathI
 			identityValue, host,
 		)
 	}
-	score := terms.Score()
+	score := terms.UtilityScore()
 	termsJSON, _ := json.Marshal(terms)
 	params, _ := json.Marshal(map[string]any{
 		"service_entity_id":  serviceEntityID,

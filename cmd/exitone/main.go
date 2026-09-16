@@ -9,14 +9,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"context"
 
 	"exitone/internal/debuglog"
+	"exitone/internal/focus"
 	"exitone/internal/hypothesis"
+	"exitone/internal/ingestsource"
 	"exitone/internal/investigation"
 	"exitone/internal/llm"
 	"exitone/internal/methodology"
@@ -25,7 +30,6 @@ import (
 	"exitone/internal/stage"
 	"exitone/internal/store"
 	"exitone/internal/strategy"
-	"exitone/internal/temporal"
 
 	"github.com/google/uuid"
 )
@@ -50,7 +54,7 @@ func main() {
 	// Sin argumentos (o `exitone repl`) → modo interactivo: el operador queda
 	// "dentro" del programa en vez de repetir `exitone` en cada comando.
 	if len(os.Args) < 2 || os.Args[1] == "repl" {
-		runRepl()
+		runConsole()
 		return
 	}
 
@@ -93,6 +97,8 @@ func dispatch(s *store.Store, cmd string, args []string) {
 		cmdStages(s)
 	case "dismiss":
 		cmdDismiss(s, args)
+	case "focus":
+		cmdFocus(s, args)
 	case "ask":
 		cmdAsk(s, args)
 	case "watch":
@@ -116,6 +122,7 @@ Uso:
       (agnóstico: detecta nmap/smbclient por contenido; si no reconoce el
        formato, cae automáticamente a extracción Nivel 2 vía LLM local)
   exitone ingest identities <archivo.txt> --source <origen>
+  exitone ingest watch <directorio>   (observa el directorio, ingiere cada archivo nuevo automáticamente — Ctrl+C para salir)
   exitone next [--raw]
   exitone why <candidate-id-prefix>
   exitone status
@@ -123,15 +130,30 @@ Uso:
   exitone resolve <action-id-prefix> --result <fail|success>
   exitone stages
   exitone dismiss <candidate-id-prefix>
+  exitone focus <hypothesis-or-objective-id-prefix>   (dónde invertir esfuerzo — siempre explícito, nunca inferido)
+  exitone focus clear
+  exitone focus   (sin argumentos: muestra el focus activo, si hay uno)
   exitone ask "<pregunta>"   (chat contextual anclado al estado real, vía LLM local)
   exitone watch [--interval <segundos>]   (dashboard en vivo, solo lectura)
   exitone start <target> [--tmux]   (arranca la app: terminal embebida + dashboard en vivo — sin tmux; --tmux usa el layout anterior de dos panes)
   exitone tui   (la app completa directamente, sesión ya activa)`)
 }
 
+// interactiveMode y consoleAbort son el ÚNICO puente entre la Control
+// Console nueva (cmd/exitone/console_*.go) y los cmdXxx legacy, que llaman
+// fatal()->os.Exit(1). Fuera de la consola (modo comando único) el
+// comportamiento es idéntico al de siempre. Ver plan, sección B: el resto
+// de la consola nunca usa panic/recover, solo legacyAdapter (console_bridge.go).
+var interactiveMode bool
+
+type consoleAbort string
+
 func fatal(format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
 	debuglog.Log("fatal_error", map[string]any{"message": msg})
+	if interactiveMode {
+		panic(consoleAbort(msg))
+	}
 	fmt.Fprintf(os.Stderr, "error: %s\n", msg)
 	os.Exit(1)
 }
@@ -230,6 +252,68 @@ func parseFlags(args []string) (positional []string, flags map[string]string) {
 	return
 }
 
+// shellEventMeta es el JSON que los shell hooks (contrib/exitone-hooks.zsh)
+// ya construyen a partir de datos que siempre tuvieron (preexec/precmd) pero
+// nunca llegaban a la base de datos — Fase 1 del plan de arquitectura: cerrar
+// la cadena de provenance Event→Evidence→Observation, que hasta ahora
+// quedaba rota en la práctica porque evidence.event_id era NULL en los tres
+// caminos reales de ingesta pese a que el hook sí conocía el comando exacto.
+type shellEventMeta struct {
+	Pane      string  `json:"pane"`
+	Command   string  `json:"command"`
+	Cwd       string  `json:"cwd"`
+	StartedAt float64 `json:"started_at"`
+	EndedAt   float64 `json:"ended_at"`
+	ExitCode  int     `json:"exit_code"`
+}
+
+// resolveEvent crea la fila `event` correspondiente al comando de shell que
+// disparó este ingest. Devuelve "" si no hay --event (ingest manual, o un
+// futuro FileWatchEventSource sin comando asociado) — evidence.event_id
+// sigue NULL en ese caso, legítimamente: esto no inventa un evento donde no
+// existe, solo deja de descartar el que el hook sí reportó.
+func resolveEvent(s *store.Store, sessionID, eventJSON string) string {
+	if eventJSON == "" {
+		return ""
+	}
+	var meta shellEventMeta
+	if err := json.Unmarshal([]byte(eventJSON), &meta); err != nil {
+		debuglog.LogError("resolve_event_parse", err, map[string]any{"raw": eventJSON})
+		return ""
+	}
+	pane := meta.Pane
+	if pane == "none" {
+		pane = ""
+	}
+	id := uuid.NewString()
+	if _, err := s.DB.Exec(
+		`INSERT INTO event(id, session_id, tmux_pane_id, command_raw, cwd, started_at, ended_at, exit_code, source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'shell_hook')`,
+		id, sessionID, nullIfEmpty(pane), meta.Command, nullIfEmpty(meta.Cwd),
+		nullIfEmpty(epochToRFC3339(meta.StartedAt)), nullIfEmpty(epochToRFC3339(meta.EndedAt)), meta.ExitCode,
+	); err != nil {
+		debuglog.LogError("resolve_event_insert", err, map[string]any{"raw": eventJSON})
+		return ""
+	}
+	return id
+}
+
+func epochToRFC3339(epoch float64) string {
+	if epoch == 0 {
+		return ""
+	}
+	sec := int64(epoch)
+	nsec := int64((epoch - float64(sec)) * 1e9)
+	return time.Unix(sec, nsec).UTC().Format(time.RFC3339Nano)
+}
+
+func nullIfEmpty(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
 func cmdIngest(s *store.Store, args []string) {
 	if len(args) < 1 {
 		fatal("uso: exitone ingest <archivo> [--tool <hint>] [--host <ip>] [--for-action <id>]")
@@ -248,7 +332,21 @@ func cmdIngest(s *store.Store, args []string) {
 		if source == "" {
 			source = "manual"
 		}
-		ingestIdentities(s, sessionID, rest[0], source)
+		eventID := resolveEvent(s, sessionID, flags["event"])
+		ingestIdentities(s, sessionID, rest[0], eventID, source)
+		return
+	}
+
+	// 'watch <directorio>' — Fase 5 del plan de arquitectura:
+	// FileWatchEventSource. Observa el directorio y llama a `exitone ingest`
+	// (self-exec, mismo patrón que el REPL) por cada archivo nuevo — nunca
+	// decide qué es un hecho, solo entrega artefactos crudos al pipeline
+	// existente. Bloquea hasta Ctrl+C.
+	if args[0] == "watch" {
+		if len(args) < 2 {
+			fatal("uso: exitone ingest watch <directorio>")
+		}
+		cmdIngestWatch(args[1])
 		return
 	}
 
@@ -257,6 +355,11 @@ func cmdIngest(s *store.Store, args []string) {
 		fatal("falta la ruta del archivo de evidencia")
 	}
 	path := rest[0]
+	// --event <json>: metadata del comando de shell que produjo este archivo
+	// (pane/command/cwd/started_at/ended_at/exit_code), ya construida por
+	// contrib/exitone-hooks.zsh — ausente en un ingest manual, y ahí NULL en
+	// evidence.event_id sigue siendo correcto.
+	eventID := resolveEvent(s, sessionID, flags["event"])
 
 	// Ingest agnóstico a la herramienta (sección 6 del plan, "Universal Output
 	// Ingestion"): se detecta el formato por contenido en vez de exigir que el
@@ -277,7 +380,7 @@ func cmdIngest(s *store.Store, args []string) {
 	// así que se intenta antes de caer a las rutas existentes.
 	shape := parsers.DetectShape(content)
 	debuglog.Log("ingest_detect_shape", map[string]any{"file": path, "shape": int(shape)})
-	if genericIngest(s, sessionID, path, content, shape) {
+	if genericIngest(s, sessionID, path, content, shape, eventID) {
 		return
 	}
 
@@ -286,20 +389,59 @@ func cmdIngest(s *store.Store, args []string) {
 
 	switch format {
 	case parsers.FormatNmapGreppable:
-		ingestNmap(s, sessionID, path, flags["for-action"])
+		ingestNmap(s, sessionID, path, eventID, flags["for-action"])
 	case parsers.FormatSmbclientListing:
 		host := flags["host"]
 		if host == "" {
 			fatal("se detectó salida de smbclient pero falta --host <ip> (no se puede resolver la entidad host de forma agnóstica)")
 		}
-		ingestSmbclient(s, sessionID, path, host, flags["for-action"])
+		ingestSmbclient(s, sessionID, path, eventID, host, flags["for-action"])
 	default:
 		hint := toolHint
 		if hint == "" {
 			hint = "unknown"
 		}
 		fmt.Printf("Formato no reconocido por ningún parser determinista — usando extracción Nivel 2 (LLM) para %q\n", hint)
-		ingestRaw(s, sessionID, path, hint)
+		ingestRaw(s, sessionID, path, eventID, hint)
+	}
+}
+
+// cliIngestSink es el ArtifactSink concreto para el CLI: reinvoca este mismo
+// binario (self-exec, mismo patrón que repl.go) por cada archivo nuevo, en
+// vez de llamar dispatch() in-process — así un error en un archivo no mata
+// el watcher completo, y se reusa el 100% del pipeline de `exitone ingest`
+// sin duplicar su lógica aquí.
+type cliIngestSink struct{ selfPath string }
+
+func (c cliIngestSink) Accept(path string) error {
+	cmd := exec.Command(c.selfPath, "ingest", path)
+	out, err := cmd.CombinedOutput()
+	if len(out) > 0 {
+		fmt.Print(string(out))
+	}
+	return err
+}
+
+// cmdIngestWatch implementa la Fase 5 del plan de arquitectura:
+// FileWatchEventSource observando un directorio, bloqueando hasta Ctrl+C.
+func cmdIngestWatch(dir string) {
+	selfPath, err := os.Executable()
+	if err != nil {
+		selfPath = os.Args[0]
+	}
+	src := &ingestsource.FileWatchEventSource{Dir: dir}
+	fmt.Printf("Observando %s — Ctrl+C para salir. Cada archivo nuevo se ingiere automáticamente.\n", dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	if err := src.Run(ctx, cliIngestSink{selfPath: selfPath}); err != nil && err != context.Canceled {
+		fatal("observar directorio: %v", err)
 	}
 }
 
@@ -307,7 +449,7 @@ func cmdIngest(s *store.Store, args []string) {
 // detectada (XML/JSON/tabla — nunca por nombre de herramienta). Devuelve
 // false si la forma no calzó con ningún alias de campo reconocible, para que
 // cmdIngest caiga a las rutas específicas existentes sin romper nada.
-func genericIngest(s *store.Store, sessionID, path string, content []byte, shape parsers.Shape) bool {
+func genericIngest(s *store.Store, sessionID, path string, content []byte, shape parsers.Shape, eventID string) bool {
 	var result parsers.ScanResult
 	var ok bool
 	switch shape {
@@ -325,7 +467,7 @@ func genericIngest(s *store.Store, sessionID, path string, content []byte, shape
 	}
 
 	absPath, _ := filepath.Abs(path)
-	res, err := investigation.ApplyScanResult(s, sessionID, absPath, result)
+	res, err := investigation.ApplyScanResult(s, sessionID, absPath, eventID, result)
 	if err != nil {
 		fatal("ingerir evidencia (extractor genérico): %v", err)
 	}
@@ -361,7 +503,7 @@ func genericIngest(s *store.Store, sessionID, path string, content []byte, shape
 	return true
 }
 
-func ingestIdentities(s *store.Store, sessionID, path, source string) {
+func ingestIdentities(s *store.Store, sessionID, path, eventID, source string) {
 	f, err := os.Open(path)
 	if err != nil {
 		fatal("abrir archivo de evidencia: %v", err)
@@ -373,7 +515,7 @@ func ingestIdentities(s *store.Store, sessionID, path, source string) {
 		fatal("parsear identidades: %v", err)
 	}
 	absPath, _ := filepath.Abs(path)
-	res, err := investigation.IngestIdentities(s, sessionID, absPath, source, names)
+	res, err := investigation.IngestIdentities(s, sessionID, absPath, eventID, source, names)
 	if err != nil {
 		fatal("ingerir identidades: %v", err)
 	}
@@ -382,15 +524,14 @@ func ingestIdentities(s *store.Store, sessionID, path, source string) {
 		"session": sessionID, "source": source, "names": names, "new_entities": res.NewEntities,
 	})
 
-	reopened, err := temporal.DetectReopenings(s, sessionID)
-	if err != nil {
-		fatal("evaluar reaperturas: %v", err)
-	}
-	if len(reopened) > 0 {
-		fmt.Printf("⚠ Hipótesis reabiertas por evidencia estructural nueva: %d\n", len(reopened))
-	}
-	debuglog.Log("detect_reopenings", map[string]any{"session": sessionID, "reopened_hypotheses": reopened})
-
+	// Fase 3 del plan de arquitectura: una identidad nueva ya no dispara una
+	// reapertura de hipótesis por diff de conjuntos — es cobertura pendiente,
+	// y generateCandidates() la refleja directamente (ver ssh.go:
+	// candidateExists genera un candidato test_ssh_auth por cada par
+	// servicio/identidad todavía no propuesto, sin pasar por ninguna
+	// hypothesis). La reapertura genuina (hypothesis.Contradict) queda
+	// reservada para cuando evidencia nueva contradiga específicamente un
+	// cierre previo, no para "apareció una entidad nueva".
 	generateCandidates(s, sessionID)
 }
 
@@ -399,7 +540,7 @@ func ingestIdentities(s *store.Store, sessionID, path, source string) {
 // Observation queda con status='candidate' y confidence acotada (ver
 // internal/llm/extract.go). El operador debe revisar `exitone status` y
 // corroborar antes de actuar sobre estas entidades.
-func ingestRaw(s *store.Store, sessionID, path, toolHint string) {
+func ingestRaw(s *store.Store, sessionID, path, eventID, toolHint string) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		fatal("abrir archivo de evidencia: %v", err)
@@ -421,7 +562,7 @@ func ingestRaw(s *store.Store, sessionID, path, toolHint string) {
 	}
 
 	absPath, _ := filepath.Abs(path)
-	res, err := investigation.IngestGeneric(s, sessionID, absPath, toolHint, obs)
+	res, err := investigation.IngestGeneric(s, sessionID, absPath, eventID, toolHint, obs)
 	if err != nil {
 		fatal("ingerir evidencia Nivel 2: %v", err)
 	}
@@ -439,7 +580,7 @@ func ingestRaw(s *store.Store, sessionID, path, toolHint string) {
 	// antes de disparar el Candidate Generator sobre entidades type=llm.
 }
 
-func ingestNmap(s *store.Store, sessionID, path, forAction string) {
+func ingestNmap(s *store.Store, sessionID, path, eventID, forAction string) {
 	f, err := os.Open(path)
 	if err != nil {
 		fatal("abrir archivo de evidencia: %v", err)
@@ -455,7 +596,7 @@ func ingestNmap(s *store.Store, sessionID, path, forAction string) {
 	}
 
 	absPath, _ := filepath.Abs(path)
-	res, err := investigation.IngestNmap(s, sessionID, absPath, ports)
+	res, err := investigation.IngestNmap(s, sessionID, absPath, eventID, ports)
 	if err != nil {
 		fatal("ingerir evidencia: %v", err)
 	}
@@ -488,7 +629,7 @@ func ingestNmap(s *store.Store, sessionID, path, forAction string) {
 	generateCandidates(s, sessionID)
 }
 
-func ingestSmbclient(s *store.Store, sessionID, path, host, forAction string) {
+func ingestSmbclient(s *store.Store, sessionID, path, eventID, host, forAction string) {
 	f, err := os.Open(path)
 	if err != nil {
 		fatal("abrir archivo de evidencia: %v", err)
@@ -501,7 +642,7 @@ func ingestSmbclient(s *store.Store, sessionID, path, host, forAction string) {
 	}
 
 	absPath, _ := filepath.Abs(path)
-	res, err := investigation.IngestSmbclient(s, sessionID, absPath, host, listing)
+	res, err := investigation.IngestSmbclient(s, sessionID, absPath, eventID, host, listing)
 	if err != nil {
 		fatal("ingerir evidencia: %v", err)
 	}
@@ -606,45 +747,114 @@ func cmdNext(s *store.Store, args []string) {
 	}
 
 	sessionID := currentSession(s)
+	// LEFT JOIN a objective_path para poder reordenar por `focus` cuando el
+	// focus activo es un objective (Fase 2) — el candidato no guarda
+	// objective_id directo, solo objective_path_id.
 	rows, err := s.DB.Query(`
-		SELECT id, source, tool, command_template_rendered, score, explanation
-		FROM candidate
-		WHERE session_id = ? AND status = 'proposed'
-		ORDER BY score DESC`, sessionID)
+		SELECT c.id, c.source, c.tool, c.command_template_rendered, c.score, c.explanation,
+		       c.hypothesis_id, op.objective_id
+		FROM candidate c
+		LEFT JOIN objective_path op ON op.id = c.objective_path_id
+		WHERE c.session_id = ? AND c.status = 'proposed'
+		ORDER BY c.score DESC`, sessionID)
 	if err != nil {
 		fatal("consultar candidatos: %v", err)
 	}
 	defer rows.Close()
 
-	rank := 1
-	any := false
+	type candRow struct {
+		id, source, tool, cmdRendered, explanation string
+		score                                       float64
+		hypothesisID, objectiveID                   sql.NullString
+	}
+	var all []candRow
 	for rows.Next() {
-		any = true
-		var id, source, tool, cmdRendered, explanation string
-		var score float64
-		if err := rows.Scan(&id, &source, &tool, &cmdRendered, &score, &explanation); err != nil {
+		var c candRow
+		if err := rows.Scan(&c.id, &c.source, &c.tool, &c.cmdRendered, &c.score, &c.explanation, &c.hypothesisID, &c.objectiveID); err != nil {
 			fatal("leer candidato: %v", err)
 		}
+		all = append(all, c)
+	}
+
+	// `focus` reordena (NUNCA oculta) — los candidatos relacionados al focus
+	// activo pasan primero, conservando el orden por score dentro de cada
+	// grupo (partición estable, dos pasadas sobre la lista ya ordenada).
+	f, err := focus.Get(s, sessionID)
+	if err != nil {
+		fatal("leer focus: %v", err)
+	}
+	ordered := all
+	if f != nil {
+		related := func(c candRow) bool {
+			switch f.RefType {
+			case "hypothesis":
+				return c.hypothesisID.Valid && c.hypothesisID.String == f.RefID
+			case "objective":
+				return c.objectiveID.Valid && c.objectiveID.String == f.RefID
+			}
+			return false
+		}
+		var first, rest []candRow
+		for _, c := range all {
+			if related(c) {
+				first = append(first, c)
+			} else {
+				rest = append(rest, c)
+			}
+		}
+		ordered = append(first, rest...)
+		if !raw && len(first) > 0 {
+			fmt.Printf("Focus activo: %s %s — candidatos relacionados primero\n\n", f.RefType, f.RefID[:8])
+		}
+	}
+
+	if !raw {
+		if warning, err := strategy.DetectRabbitHole(s, sessionID); err != nil {
+			fatal("evaluar rabbit-hole: %v", err)
+		} else if warning != nil {
+			printRabbitHoleWarning(warning, f)
+		}
+	}
+
+	if len(ordered) == 0 && !raw {
+		fmt.Println("No hay candidatos pendientes. Corre `exitone ingest nmap <archivo>` primero, o `exitone status`.")
+		return
+	}
+	for i, c := range ordered {
 		if raw {
 			// --raw: solo el top-1, texto plano listo para insertar en el
 			// buffer del shell (Ctrl+Space) — nunca se ejecuta desde aquí.
-			if rank == 1 {
-				fmt.Println(cmdRendered)
+			if i == 0 {
+				fmt.Println(c.cmdRendered)
 			}
-		} else {
-			fmt.Printf("%d. [%s] %s — score %.2f (id %s)\n", rank, source, tool, score, id[:8])
-			fmt.Printf("   %s\n", cmdRendered)
+			continue
 		}
-		rank++
+		fmt.Printf("%d. [%s] %s — score %.2f (id %s)\n", i+1, c.source, c.tool, c.score, c.id[:8])
+		fmt.Printf("   %s\n", c.cmdRendered)
 	}
-	if !any && !raw {
-		fmt.Println("No hay candidatos pendientes. Corre `exitone ingest nmap <archivo>` primero, o `exitone status`.")
+}
+
+// printRabbitHoleWarning — sección K.3 del plan: `focus` NUNCA suprime el
+// aviso, solo lo anota. Human-in-the-loop no significa "dejar de advertir
+// cuando el operador elige seguir en una rama estancada" — el operador
+// conserva la autoridad de seguir ahí, ExitOne conserva la obligación de
+// decirlo.
+func printRabbitHoleWarning(w *strategy.RabbitHoleWarning, f *focus.Focus) {
+	focusedHere := f != nil && f.RefType == "objective" && f.RefID == w.StagnantObjectiveID
+	if focusedHere {
+		fmt.Printf("Operator focus: %s\n", w.StagnantIntentKey)
+		fmt.Println("Branch appears stagnant.")
+		fmt.Println("Recommendation retained because focus is explicit.")
+		fmt.Printf("(%d intentos de %q sin evidencia nueva)\n\n", w.AttemptCount, w.StagnantIntentKey)
+		return
 	}
+	fmt.Printf("⚠ Rama estancada: %d intentos de %q sin evidencia nueva.\n", w.AttemptCount, w.StagnantIntentKey)
+	fmt.Printf("  Despriorizar esta rama. Investigar en su lugar: %s\n\n", w.AlternativeDescription)
 }
 
 func cmdWhy(s *store.Store, args []string) {
 	if len(args) < 1 {
-		fatal("uso: exitone why <candidate-id-prefix>")
+		fatal("uso: exitone why <candidate-id-prefix | hypothesis-id-prefix>")
 	}
 	prefix := args[0]
 	var id, explanation, scoreTermsJSON string
@@ -654,7 +864,17 @@ func cmdWhy(s *store.Store, args []string) {
 		WHERE id LIKE ? || '%' ORDER BY created_at DESC LIMIT 1`, prefix,
 	).Scan(&id, &explanation, &score, &scoreTermsJSON)
 	if err == sql.ErrNoRows {
-		fatal("no se encontró un candidato con prefijo %q", prefix)
+		// No es un candidato — se intenta como hipótesis (Fase 3 del plan:
+		// `why` responde igual para ambos conceptos, cada uno con su propio
+		// formato de explicación).
+		exp, hypErr := hypothesis.Explain(s, prefix)
+		if hypErr != nil {
+			fatal("no se encontró un candidato ni una hipótesis con prefijo %q", prefix)
+		}
+		fmt.Printf("Hipótesis %s\n\nStatus: %s\n\n%s\n\n", prefix, strings.ToUpper(string(exp.Status)), exp.Statement)
+		fmt.Printf("Supporting observations: %d\n", exp.SupportingObservations)
+		fmt.Printf("Contradicting observations: %d\n", exp.ContradictingObservations)
+		return
 	}
 	if err != nil {
 		fatal("consultar candidato: %v", err)
@@ -826,19 +1046,15 @@ func cmdResolve(s *store.Store, args []string) {
 	}
 	sessionID := currentSession(s)
 
-	hypID, err := hypothesis.RecordResult(s, sessionID, rest[0], result)
+	// Fase 3 del plan de arquitectura: ya no se crea una hypothesis por cada
+	// intento — la cobertura (qué identidades ya se probaron) la refleja
+	// directamente la tabla `candidate` (ver internal/strategy/ssh.go).
+	actionID, err := outcome.RecordManualResult(s, rest[0], result)
 	if err != nil {
 		fatal("registrar resultado: %v", err)
 	}
-	fmt.Printf("Hipótesis registrada: %s (resultado: %s)\n", hypID[:8], result)
+	fmt.Printf("Resultado registrado: acción %s (%s)\n", actionID[:8], result)
 
-	reopened, err := temporal.DetectReopenings(s, sessionID)
-	if err != nil {
-		fatal("evaluar reaperturas: %v", err)
-	}
-	if len(reopened) > 0 {
-		fmt.Printf("⚠ Hipótesis reabiertas: %d\n", len(reopened))
-	}
 	generateCandidates(s, sessionID)
 }
 
@@ -855,6 +1071,43 @@ func cmdDismiss(s *store.Store, args []string) {
 		fatal("no se encontró un candidato pendiente con prefijo %q", args[0])
 	}
 	fmt.Println("Candidato descartado.")
+}
+
+// cmdFocus — Fase 2 del plan de arquitectura: dónde quiere el operador
+// invertir esfuerzo ahora mismo. Siempre explícito (esta función es la
+// ÚNICA forma de fijarlo), nunca inferido — a diferencia de `stage`.
+func cmdFocus(s *store.Store, args []string) {
+	sessionID := currentSession(s)
+
+	if len(args) == 0 {
+		f, err := focus.Get(s, sessionID)
+		if err != nil {
+			fatal("leer focus: %v", err)
+		}
+		if f == nil {
+			fmt.Println("Sin focus activo.")
+			return
+		}
+		fmt.Printf("Focus activo: %s %s (fijado %s)\n", f.RefType, f.RefID[:8], f.SetAt)
+		return
+	}
+
+	if args[0] == "clear" {
+		if err := focus.Clear(s, sessionID); err != nil {
+			fatal("limpiar focus: %v", err)
+		}
+		fmt.Println("Focus limpiado.")
+		return
+	}
+
+	refType, refID, err := focus.Resolve(s, sessionID, args[0])
+	if err != nil {
+		fatal("%v", err)
+	}
+	if err := focus.Set(s, sessionID, refType, refID); err != nil {
+		fatal("fijar focus: %v", err)
+	}
+	fmt.Printf("Focus fijado: %s %s\n", refType, refID[:8])
 }
 
 func cmdStages(s *store.Store) {

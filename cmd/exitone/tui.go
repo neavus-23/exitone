@@ -74,6 +74,8 @@ type tuiModel struct {
 	paused     bool        // Ctrl+P (tomado de PentestGPT): congela el refresco del panel
 	showHelp   bool        // F1 (tomado de PentestGPT): overlay de ayuda contextual
 	mode       sidebarMode // Tab: cicla Overview/Graph/Vault
+	streamFile *os.File    // Fase 0: espejo de los bytes crudos del PTY, mismo formato/ruta
+	                       // que tmux pipe-pane escribía antes — hooks.zsh lo consume igual
 }
 
 func newTUIModel(s *store.Store) *tuiModel {
@@ -108,6 +110,23 @@ func (m *tuiModel) startShell() tea.Cmd {
 	}
 	c := exec.Command(shell, "-i")
 	c.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	// Fase 0 del plan de arquitectura de captura: la TUI embebida es la
+	// fuente PRIMARIA (ya posee el PTY y recibe todos sus bytes), tmux
+	// pipe-pane pasa a ser fallback. Se le da al shell embebido su propio
+	// EXITONE_STREAM_FILE (uno por proceso de TUI, vía PID) y hooks.zsh lo
+	// respeta tal cual en vez de derivarlo de TMUX_PANE — mismo formato de
+	// archivo que pipe-pane escribía, así que el recorte por offset de
+	// bytes que hooks.zsh ya hace (__exitone_maybe_capture_full_output)
+	// funciona sin ningún cambio de lógica ahí, solo de origen del archivo.
+	streamDir := filepath.Join(os.Getenv("HOME"), ".exitone", "streams")
+	if err := os.MkdirAll(streamDir, 0755); err == nil {
+		streamPath := filepath.Join(streamDir, fmt.Sprintf("tui%d.log", os.Getpid()))
+		if f, err := os.OpenFile(streamPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			m.streamFile = f
+			c.Env = append(c.Env, "EXITONE_STREAM_FILE="+streamPath)
+		}
+	}
 
 	ptmx, err := pty.StartWithSize(c, &pty.Winsize{Rows: uint16(m.termHeight), Cols: uint16(m.termWidth)})
 	if err != nil {
@@ -195,12 +214,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ptyOutputMsg:
+		if m.streamFile != nil {
+			m.streamFile.Write(msg)
+		}
 		m.emu.Write(msg)
 		return m, waitForPtyOutput(m.ptmx)
 
 	case ptyClosedMsg:
 		// El shell embebido terminó (exit/Ctrl+D) — cerramos la TUI con él,
 		// igual que pasaría si cerraras la única terminal que tenías abierta.
+		if m.streamFile != nil {
+			m.streamFile.Close()
+		}
 		m.quitting = true
 		return m, tea.Quit
 
@@ -243,6 +268,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// abrupta — le mandamos exit para que cierre limpio.
 			if m.ptmx != nil {
 				m.ptmx.Write([]byte("\r"))
+			}
+			if m.streamFile != nil {
+				m.streamFile.Close()
 			}
 			m.quitting = true
 			return m, tea.Quit

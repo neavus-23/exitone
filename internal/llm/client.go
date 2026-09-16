@@ -66,6 +66,14 @@ type chatResponse struct {
 // crudo. No hace streaming — las llamadas de ExitOne son cortas (extracción,
 // explicación puntual), no un chat interactivo largo.
 func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	// El LLM es parte de ExitOne, no un complemento que el operador arranca
+	// aparte: cada llamada garantiza primero que el sidecar esté vivo,
+	// arrancándolo si hace falta (ver server.go). El costo en el camino
+	// caliente (ya corriendo) es un GET local de ~1ms.
+	if err := EnsureRunning(ctx, c.baseURL); err != nil {
+		return "", fmt.Errorf("no se pudo asegurar el LLM local: %w", err)
+	}
+
 	reqBody := chatRequest{
 		Model: c.model,
 		Messages: []chatMessage{

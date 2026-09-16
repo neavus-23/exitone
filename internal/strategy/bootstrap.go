@@ -60,7 +60,7 @@ func GenerateInitialDiscoveryCandidates(s *store.Store, sessionID string) ([]str
 			UncertaintyReduction: 0.9, // no se sabe absolutamente nada del target todavía
 			RedundancyPenalty:    0,
 		}
-		score := terms.Score()
+		score := terms.UtilityScore()
 		explanation := fmt.Sprintf(
 			"No existe información de servicios para %s (Investigation State vacío).\n"+
 				"Ningún reconocimiento se ha intentado todavía (0 intentos previos).\n"+

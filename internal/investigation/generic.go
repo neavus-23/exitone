@@ -18,7 +18,7 @@ import (
 // aparezcan en el Investigation Model y el operador las vea), pero quedan
 // etiquetadas attrs.extracted_by="llm" para que cualquier consumidor futuro
 // pueda tratarlas con más cautela que una entidad de Nivel 1.
-func IngestGeneric(s *store.Store, sessionID, rawOutputRef, toolName string, obs []llm.CandidateObservation) (*IngestResult, error) {
+func IngestGeneric(s *store.Store, sessionID, rawOutputRef, eventID, toolName string, obs []llm.CandidateObservation) (*IngestResult, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res := &IngestResult{}
 
@@ -31,8 +31,8 @@ func IngestGeneric(s *store.Store, sessionID, rawOutputRef, toolName string, obs
 	evidenceID := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO evidence(id, event_id, raw_output_ref, tool_name, parse_level, created_at)
-		 VALUES (?, NULL, ?, ?, 2, ?)`,
-		evidenceID, rawOutputRef, toolName, now,
+		 VALUES (?, ?, ?, ?, 2, ?)`,
+		evidenceID, nullableString(eventID), rawOutputRef, toolName, now,
 	); err != nil {
 		return nil, fmt.Errorf("insert evidence: %w", err)
 	}

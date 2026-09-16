@@ -39,7 +39,14 @@ typeset -g __exitone_stream_start_offset=0
 # en el nombre al construirlo directamente con $TMUX_PANE.
 typeset -g __exitone_pane_id="${TMUX_PANE#%}"
 __exitone_pane_id="${__exitone_pane_id//[^0-9]/}"
-typeset -g EXITONE_STREAM_FILE="$HOME/.exitone/streams/pane${__exitone_pane_id:-none}.log"
+# Fase 0 del plan de arquitectura: la TUI embebida (PTY propio) es la fuente
+# de captura PRIMARIA, tmux pipe-pane es el FALLBACK. Si `exitone tui` ya
+# exportó EXITONE_STREAM_FILE al lanzar este shell (porque ella misma está
+# escribiendo los bytes crudos de la sesión a ese archivo), se respeta tal
+# cual — nunca se sobrescribe con la ruta derivada de TMUX_PANE. Solo si no
+# vino ya seteado (uso normal de zsh sin la TUI, o dentro de --tmux) se
+# deriva del pane de tmux como antes.
+typeset -g EXITONE_STREAM_FILE="${EXITONE_STREAM_FILE:-$HOME/.exitone/streams/pane${__exitone_pane_id:-none}.log}"
 
 # Arranca pipe-pane UNA vez por pane (evita el toggle-off de tmux si se
 # vuelve a invocar sin cambiar el comando — por eso se comprueba primero).
@@ -50,6 +57,20 @@ if [[ -n "$TMUX_PANE" ]]; then
   fi
   unset __exitone_already_piped
 fi
+
+__exitone_build_event_json() {
+  # Fase 1 del plan de arquitectura: este JSON es lo que faltaba para cerrar
+  # la cadena de provenance Event→Evidence→Observation — precmd YA conoce
+  # comando/cwd/timestamps/exit_code (se loggeaban a events.jsonl desde
+  # siempre), pero nunca llegaban al `exitone ingest` que dispara la
+  # creación de la evidencia. resolveEvent() en el lado Go lo consume.
+  local cmd="$1" cwd="$2" started="$3" ended="$4" exit_code="$5"
+  local esc_cmd esc_cwd
+  esc_cmd=$(__exitone_json_escape "$cmd")
+  esc_cwd=$(__exitone_json_escape "$cwd")
+  printf '{"pane":"%s","command":"%s","cwd":"%s","started_at":%s,"ended_at":%s,"exit_code":%d}' \
+    "${TMUX_PANE:-none}" "$esc_cmd" "$esc_cwd" "$started" "$ended" "$exit_code"
+}
 
 __exitone_json_escape() {
   local s="$1"
@@ -111,7 +132,7 @@ __exitone_extract_host() {
 # Devuelve 0 (éxito) si encontró y procesó un archivo de salida explícito —
 # el llamador usa esto para NO duplicar con la captura de pipe-pane de abajo.
 __exitone_maybe_autoingest_file() {
-  local cmd="$1" exit_code="$2"
+  local cmd="$1" exit_code="$2" event_json="$3"
   [[ $exit_code -ne 0 ]] && return 1
   [[ "$cmd" == exitone* ]] && return 1
 
@@ -124,9 +145,9 @@ __exitone_maybe_autoingest_file() {
 
   print -P "%F{cyan}[exitone]%f auto-ingiriendo salida de '$toolname': $file"
   if [[ -n "$host" ]]; then
-    exitone ingest "$file" --tool "$toolname" --host "$host" 2>&1 | sed 's/^/[exitone] /'
+    exitone ingest "$file" --tool "$toolname" --host "$host" --event "$event_json" 2>&1 | sed 's/^/[exitone] /'
   else
-    exitone ingest "$file" --tool "$toolname" 2>&1 | sed 's/^/[exitone] /'
+    exitone ingest "$file" --tool "$toolname" --event "$event_json" 2>&1 | sed 's/^/[exitone] /'
   fi
   return 0
 }
@@ -148,10 +169,14 @@ __exitone_is_noise_command() {
 # correspondiente a este comando (por offset de bytes) y lo manda al mismo
 # pipeline de ingesta agnóstico, en segundo plano para no bloquear el prompt.
 __exitone_maybe_capture_full_output() {
-  local cmd="$1" exit_code="$2"
+  local cmd="$1" exit_code="$2" event_json="$3"
   [[ $exit_code -ne 0 ]] && return
   [[ "$cmd" == exitone* ]] && return
-  [[ -z "$TMUX_PANE" || ! -f "$EXITONE_STREAM_FILE" ]] && return
+  # Antes exigía TMUX_PANE (solo funcionaba bajo tmux real) — con la TUI
+  # embebida como fuente primaria (Fase 0), lo único que importa es que
+  # EXITONE_STREAM_FILE exista y tenga contenido, venga de pipe-pane o de la
+  # TUI escribiendo directamente los bytes del PTY.
+  [[ -z "$EXITONE_STREAM_FILE" || ! -f "$EXITONE_STREAM_FILE" ]] && return
 
   local first_word="$(__exitone_first_word "$cmd")"
   __exitone_is_noise_command "$first_word" && return
@@ -171,7 +196,7 @@ __exitone_maybe_capture_full_output() {
 
   print -P "%F{gray}[exitone] capturando output completo de '$first_word' en segundo plano (Nivel 2 si no hay parser)...%f"
   (
-    exitone ingest "$slice_file" --tool "$first_word" >> "$HOME/.exitone/background_ingest.log" 2>&1
+    exitone ingest "$slice_file" --tool "$first_word" --event "$event_json" >> "$HOME/.exitone/background_ingest.log" 2>&1
     rm -f "$slice_file"
   ) &
   disown
@@ -201,8 +226,11 @@ __exitone_precmd() {
     printf '}\n'
   } >> "$EXITONE_EVENTS_LOG"
 
-  if ! __exitone_maybe_autoingest_file "$__exitone_cmd" "$exit_code"; then
-    __exitone_maybe_capture_full_output "$__exitone_cmd" "$exit_code"
+  local event_json
+  event_json=$(__exitone_build_event_json "$__exitone_cmd" "$__exitone_cwd" "$__exitone_start_epoch" "$end_epoch" "$exit_code")
+
+  if ! __exitone_maybe_autoingest_file "$__exitone_cmd" "$exit_code" "$event_json"; then
+    __exitone_maybe_capture_full_output "$__exitone_cmd" "$exit_code" "$event_json"
   fi
   __exitone_cmd=""
 }
