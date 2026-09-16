@@ -22,7 +22,7 @@ import (
 // cascada al upsert de su Host si todavía no se conocía (misma sesión, un
 // solo paso), y cada campo tocado en cualquiera de los dos se registra
 // también como Observation para no perder provenance.
-func ApplyScanResult(s *store.Store, sessionID, rawOutputRef string, r parsers.ScanResult) (*IngestResult, error) {
+func ApplyScanResult(s *store.Store, sessionID, rawOutputRef, eventID string, r parsers.ScanResult) (*IngestResult, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res := &IngestResult{}
 
@@ -35,8 +35,8 @@ func ApplyScanResult(s *store.Store, sessionID, rawOutputRef string, r parsers.S
 	evidenceID := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO evidence(id, event_id, raw_output_ref, tool_name, parse_level, created_at)
-		 VALUES (?, NULL, ?, 'generic_scan', 1, ?)`,
-		evidenceID, rawOutputRef, now,
+		 VALUES (?, ?, ?, 'generic_scan', 1, ?)`,
+		evidenceID, nullableString(eventID), rawOutputRef, now,
 	); err != nil {
 		return nil, fmt.Errorf("insert evidence: %w", err)
 	}
@@ -115,8 +115,9 @@ func ApplyScanResult(s *store.Store, sessionID, rawOutputRef string, r parsers.S
 			res.NewEntities = append(res.NewEntities, serviceID)
 		}
 
+		var serviceObsID string // hoisted: la relationship de abajo la referencia como provenance
 		if svcCreated || svcChanged {
-			obsID := uuid.NewString()
+			serviceObsID = uuid.NewString()
 			payload, _ := json.Marshal(map[string]any{
 				"host": svc.HostAddress, "port": svc.Port, "proto": proto,
 				"service": svc.Name, "state": svc.State, "product": svc.Version,
@@ -124,24 +125,28 @@ func ApplyScanResult(s *store.Store, sessionID, rawOutputRef string, r parsers.S
 			if _, err := tx.Exec(
 				`INSERT INTO observation(id, evidence_id, kind, payload, confidence, status)
 				 VALUES (?, ?, 'open_port', ?, 1.0, 'active')`,
-				obsID, evidenceID, string(payload),
+				serviceObsID, evidenceID, string(payload),
 			); err != nil {
 				return nil, fmt.Errorf("insert observation: %w", err)
 			}
 			if _, err := tx.Exec(
 				`INSERT INTO observation_entity(observation_id, entity_id) VALUES (?, ?), (?, ?)`,
-				obsID, hostID, obsID, serviceID,
+				serviceObsID, hostID, serviceObsID, serviceID,
 			); err != nil {
 				return nil, err
 			}
 		}
 
 		if svcCreated {
+			// Grieta de provenance corregida (Fase 1): antes se pasaba NULL
+			// aquí pese a existir una observation en la misma transacción
+			// (svcCreated implica svcCreated||svcChanged, así que
+			// serviceObsID siempre está poblado en este punto).
 			relID := uuid.NewString()
 			if _, err := tx.Exec(
 				`INSERT INTO relationship(id, source_entity_id, target_entity_id, kind, confidence, supporting_observation_id, valid_from, valid_to)
-				 VALUES (?, ?, ?, 'HAS_SERVICE', 1.0, NULL, ?, NULL)`,
-				relID, hostID, serviceID, now,
+				 VALUES (?, ?, ?, 'HAS_SERVICE', 1.0, ?, ?, NULL)`,
+				relID, hostID, serviceID, nullableString(serviceObsID), now,
 			); err != nil {
 				return nil, fmt.Errorf("insert relationship: %w", err)
 			}
@@ -181,19 +186,20 @@ func ApplyScanResult(s *store.Store, sessionID, rawOutputRef string, r parsers.S
 			res.NewEntities = append(res.NewEntities, endpointID)
 		}
 
+		var endpointObsID string // hoisted, ver comentario equivalente en el bloque de services arriba
 		if epCreated || epChanged {
-			obsID := uuid.NewString()
+			endpointObsID = uuid.NewString()
 			payload, _ := json.Marshal(map[string]any{"url": ep.URL, "status": ep.StatusCode, "size": ep.Size})
 			if _, err := tx.Exec(
 				`INSERT INTO observation(id, evidence_id, kind, payload, confidence, status)
 				 VALUES (?, ?, 'endpoint_discovered', ?, 1.0, 'active')`,
-				obsID, evidenceID, string(payload),
+				endpointObsID, evidenceID, string(payload),
 			); err != nil {
 				return nil, fmt.Errorf("insert observation: %w", err)
 			}
 			if _, err := tx.Exec(
 				`INSERT INTO observation_entity(observation_id, entity_id) VALUES (?, ?), (?, ?)`,
-				obsID, hostID, obsID, endpointID,
+				endpointObsID, hostID, endpointObsID, endpointID,
 			); err != nil {
 				return nil, err
 			}
@@ -203,8 +209,8 @@ func ApplyScanResult(s *store.Store, sessionID, rawOutputRef string, r parsers.S
 			relID := uuid.NewString()
 			if _, err := tx.Exec(
 				`INSERT INTO relationship(id, source_entity_id, target_entity_id, kind, confidence, supporting_observation_id, valid_from, valid_to)
-				 VALUES (?, ?, ?, 'HAS_ENDPOINT', 1.0, NULL, ?, NULL)`,
-				relID, hostID, endpointID, now,
+				 VALUES (?, ?, ?, 'HAS_ENDPOINT', 1.0, ?, ?, NULL)`,
+				relID, hostID, endpointID, nullableString(endpointObsID), now,
 			); err != nil {
 				return nil, fmt.Errorf("insert relationship: %w", err)
 			}

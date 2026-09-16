@@ -26,7 +26,7 @@ type IngestResult struct {
 // IngestNmap registra la evidencia cruda, crea una Observation por puerto
 // abierto (Nivel 1, confidence 1.0 — parser determinista) y actualiza el
 // Investigation Model (entidades host/service + relación HAS_SERVICE).
-func IngestNmap(s *store.Store, sessionID, rawOutputRef string, ports []parsers.OpenPort) (*IngestResult, error) {
+func IngestNmap(s *store.Store, sessionID, rawOutputRef, eventID string, ports []parsers.OpenPort) (*IngestResult, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res := &IngestResult{OpenPorts: ports}
 
@@ -39,8 +39,8 @@ func IngestNmap(s *store.Store, sessionID, rawOutputRef string, ports []parsers.
 	evidenceID := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO evidence(id, event_id, raw_output_ref, tool_name, parse_level, created_at)
-		 VALUES (?, NULL, ?, 'nmap', 1, ?)`,
-		evidenceID, rawOutputRef, now,
+		 VALUES (?, ?, ?, 'nmap', 1, ?)`,
+		evidenceID, nullableString(eventID), rawOutputRef, now,
 	); err != nil {
 		return nil, fmt.Errorf("insert evidence: %w", err)
 	}

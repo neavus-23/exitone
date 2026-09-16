@@ -115,15 +115,34 @@ CREATE TABLE IF NOT EXISTS candidate (
 -- una ACTION concreta y las asunciones vigentes en ese momento. Nunca se
 -- reabre interpretando texto — solo por comparación estructural de conjuntos
 -- (ver internal/temporal).
+-- `hypothesis` = una proposición falsable (Fase 3 del plan de arquitectura).
+-- Estados categóricos, nunca una fuerza derivada por conteo de evidencia:
+-- UNTESTED (recién abierta) | SUPPORTED (evidencia a favor, sin contradicción) |
+-- DISPUTED (evidencia a favor Y en contra) | REFUTED (solo evidencia en
+-- contra, cerrada) | CONFIRMED (cierre explícito, no automático) | REOPENED
+-- (una observation 'contradicts' llegó DESPUÉS de un cierre CONFIRMED/REFUTED
+-- — reapertura genuina, no "apareció una entidad nueva de cierto tipo").
 CREATE TABLE IF NOT EXISTS hypothesis (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES session(id),
     statement TEXT NOT NULL,
     subject_entity_id TEXT NOT NULL REFERENCES entity(id), -- ej. el service SSH al que aplica
-    status TEXT NOT NULL DEFAULT 'open', -- open | closed | confirmed | reopened
+    status TEXT NOT NULL DEFAULT 'untested',
     confidence REAL NOT NULL DEFAULT 1.0,
     opened_at TEXT NOT NULL,
     closed_at TEXT
+);
+
+-- Provenance de una hipótesis al nivel correcto: una OBSERVATION concreta
+-- (la afirmación atómica, ej. "445/tcp está abierto"), nunca a un EVIDENCE
+-- completo (el artefacto crudo). Trazabilidad resultante:
+-- Hypothesis → Observation → Evidence → Event.
+CREATE TABLE IF NOT EXISTS hypothesis_observation (
+    hypothesis_id TEXT NOT NULL REFERENCES hypothesis(id),
+    observation_id TEXT NOT NULL REFERENCES observation(id),
+    relation TEXT NOT NULL CHECK(relation IN ('supports','contradicts')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (hypothesis_id, observation_id)
 );
 
 -- Vincula una ACTION a la hipótesis que testeó/cerró/confirmó (sección D,
@@ -183,4 +202,30 @@ CREATE TABLE IF NOT EXISTS outcome (
 CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Fase 2 del plan de arquitectura: dónde quiere el operador invertir esfuerzo
+-- ahora mismo — siempre explícito, nunca inferido (a diferencia de `stage`,
+-- que es coverage inferido). Un solo focus activo por sesión; `next`/`status`
+-- lo usan para REORDENAR resultados, nunca para ocultarlos.
+CREATE TABLE IF NOT EXISTS focus (
+    session_id TEXT PRIMARY KEY REFERENCES session(id),
+    ref_type   TEXT NOT NULL, -- hypothesis | objective (ver plan N.5 sobre alcance)
+    ref_id     TEXT NOT NULL,
+    set_at     TEXT NOT NULL
+);
+
+-- Scope tracking (flujo bug-bounty / pentest con reglas de compromiso): qué
+-- assets están autorizados a tocarse. "pattern" es un match simple contra
+-- entity.canonical_value (substring/prefijo, NUNCA aritmética real de CIDR
+-- todavía — sección de limitaciones honestas). in_scope=0 es una exclusión
+-- EXPLÍCITA (ej. "excluido del programa aunque resuelva al mismo dominio"),
+-- no lo mismo que "no hay ninguna regla que lo mencione" (unknown).
+CREATE TABLE IF NOT EXISTS scope_rule (
+    id         TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES session(id),
+    pattern    TEXT NOT NULL,
+    in_scope   INTEGER NOT NULL, -- 1 = in-scope, 0 = excluido explícitamente
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
 );

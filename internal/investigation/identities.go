@@ -12,7 +12,7 @@ import (
 // IngestIdentities crea una entidad type=identity por cada nombre nuevo. Esta
 // es la evidencia que, más tarde, el Temporal Reasoner compara contra los
 // ACTION_ASSUMPTION de acciones ya cerradas para decidir reaperturas (D1).
-func IngestIdentities(s *store.Store, sessionID, rawOutputRef, toolName string, names []string) (*IngestResult, error) {
+func IngestIdentities(s *store.Store, sessionID, rawOutputRef, eventID, toolName string, names []string) (*IngestResult, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res := &IngestResult{}
 
@@ -25,8 +25,8 @@ func IngestIdentities(s *store.Store, sessionID, rawOutputRef, toolName string, 
 	evidenceID := uuid.NewString()
 	if _, err := tx.Exec(
 		`INSERT INTO evidence(id, event_id, raw_output_ref, tool_name, parse_level, created_at)
-		 VALUES (?, NULL, ?, ?, 1, ?)`,
-		evidenceID, rawOutputRef, toolName, now,
+		 VALUES (?, ?, ?, ?, 1, ?)`,
+		evidenceID, nullableString(eventID), rawOutputRef, toolName, now,
 	); err != nil {
 		return nil, fmt.Errorf("insert evidence: %w", err)
 	}

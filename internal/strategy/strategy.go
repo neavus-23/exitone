@@ -17,6 +17,13 @@ import (
 )
 
 // ScoreTerms — cada factor en [0,1] salvo la penalización (sección G2).
+//
+// Corrección de nomenclatura (Fase 4 del plan de arquitectura): esto NO es
+// Expected Information Gain en sentido estadístico (no hay un modelo
+// probabilístico detrás) — es una heurística multiplicativa de utilidad.
+// UtilityScore() es el nombre honesto; las columnas de DB (`candidate.score`,
+// `outcome.computed_information_gain`) se mantienen tal cual para no migrar
+// nada, pero ningún nombre Go nuevo debe sugerir más precisión de la que hay.
 type ScoreTerms struct {
 	Novelty              float64 `json:"novelty"`
 	Relevance            float64 `json:"relevance"`
@@ -27,7 +34,9 @@ type ScoreTerms struct {
 	RedundancyPenalty    float64 `json:"redundancy_penalty"`
 }
 
-func (t ScoreTerms) Score() float64 {
+// UtilityScore calcula el puntaje heurístico de un candidato — ver el
+// comentario de ScoreTerms sobre por qué no se llama "InformationGain".
+func (t ScoreTerms) UtilityScore() float64 {
 	base := t.Novelty * t.Relevance * t.SourceConfidence *
 		max(t.HypothesisImpact, 0.05) * // nunca 0 total: un candidato sin hipótesis afectadas
 		max(t.ObjectiveImpact, 0.05) * // aún puede tener algo de valor exploratorio
@@ -120,7 +129,7 @@ func GenerateAndRankMethodologyCandidates(s *store.Store, sessionID string) ([]s
 			UncertaintyReduction: 0.8,
 			RedundancyPenalty:    0,
 		}
-		score := terms.Score()
+		score := terms.UtilityScore()
 
 		explanation := fmt.Sprintf(
 			"SMB expuesto en %s (observación determinista de nmap).\n"+

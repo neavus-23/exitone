@@ -1,6 +1,7 @@
 package investigation
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func countRows(t *testing.T, s *store.Store, query string, args ...any) int {
 func TestApplyScanResult_CreatesHostAndServices(t *testing.T) {
 	s, sessionID := newTestSession(t)
 
-	res, err := ApplyScanResult(s, sessionID, "/tmp/scan.xml", sampleScanResult())
+	res, err := ApplyScanResult(s, sessionID, "/tmp/scan.xml", "", sampleScanResult())
 	if err != nil {
 		t.Fatalf("ApplyScanResult: %v", err)
 	}
@@ -89,10 +90,10 @@ func TestApplyScanResult_CreatesHostAndServices(t *testing.T) {
 func TestApplyScanResult_Idempotent(t *testing.T) {
 	s, sessionID := newTestSession(t)
 
-	if _, err := ApplyScanResult(s, sessionID, "/tmp/scan1.xml", sampleScanResult()); err != nil {
+	if _, err := ApplyScanResult(s, sessionID, "/tmp/scan1.xml", "", sampleScanResult()); err != nil {
 		t.Fatalf("first ApplyScanResult: %v", err)
 	}
-	res2, err := ApplyScanResult(s, sessionID, "/tmp/scan2.xml", sampleScanResult())
+	res2, err := ApplyScanResult(s, sessionID, "/tmp/scan2.xml", "", sampleScanResult())
 	if err != nil {
 		t.Fatalf("second ApplyScanResult: %v", err)
 	}
@@ -125,7 +126,7 @@ func TestApplyScanResult_ServiceCascadesHostUpsert(t *testing.T) {
 			{HostAddress: "10.0.0.9", Protocol: "tcp", Port: 445, Name: "smb"},
 		},
 	}
-	res, err := ApplyScanResult(s, sessionID, "/tmp/scan.json", result)
+	res, err := ApplyScanResult(s, sessionID, "/tmp/scan.json", "", result)
 	if err != nil {
 		t.Fatalf("ApplyScanResult: %v", err)
 	}
@@ -135,6 +136,64 @@ func TestApplyScanResult_ServiceCascadesHostUpsert(t *testing.T) {
 	hosts := countRows(t, s, `SELECT COUNT(*) FROM entity WHERE session_id = ? AND type = 'host' AND canonical_value = '10.0.0.9'`, sessionID)
 	if hosts != 1 {
 		t.Errorf("cascaded host not created, count = %d", hosts)
+	}
+}
+
+// TestApplyScanResult_ClosesProvenanceChain valida la Fase 1 del plan de
+// arquitectura: evidence.event_id y relationship.supporting_observation_id
+// deben quedar poblados cuando el llamador sí conoce el evento/comando que
+// produjo la evidencia — antes de este fix, ambos quedaban NULL siempre, sin
+// excepción, incluso cuando esa información existía.
+func TestApplyScanResult_ClosesProvenanceChain(t *testing.T) {
+	s, sessionID := newTestSession(t)
+
+	// Simula un evento real ya insertado por resolveEvent (cmd/exitone/main.go).
+	eventID := uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.DB.Exec(
+		`INSERT INTO event(id, session_id, command_raw, started_at, exit_code) VALUES (?, ?, ?, ?, 0)`,
+		eventID, sessionID, "nmap -sV 192.168.72.130", now,
+	); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	if _, err := ApplyScanResult(s, sessionID, "/tmp/scan.xml", eventID, sampleScanResult()); err != nil {
+		t.Fatalf("ApplyScanResult: %v", err)
+	}
+
+	var evEventID string
+	if err := s.DB.QueryRow(`SELECT event_id FROM evidence ORDER BY created_at DESC LIMIT 1`).Scan(&evEventID); err != nil {
+		t.Fatalf("query evidence.event_id: %v", err)
+	}
+	if evEventID != eventID {
+		t.Errorf("evidence.event_id = %q, want %q — la cadena Event→Evidence sigue rota", evEventID, eventID)
+	}
+
+	var relSupportingObs string
+	if err := s.DB.QueryRow(
+		`SELECT supporting_observation_id FROM relationship WHERE kind = 'HAS_SERVICE' LIMIT 1`,
+	).Scan(&relSupportingObs); err != nil {
+		t.Fatalf("query relationship.supporting_observation_id: %v", err)
+	}
+	if relSupportingObs == "" {
+		t.Error("relationship.supporting_observation_id sigue NULL pese a existir una observation en la misma transacción")
+	}
+
+	// Sin eventID (ingest manual): NULL sigue siendo el resultado correcto,
+	// no se debe inventar un evento donde no lo hay.
+	if _, err := ApplyScanResult(s, sessionID, "/tmp/scan2.xml", "", parsers.ScanResult{
+		Hosts: []parsers.HostFact{{Address: "10.0.0.50"}},
+	}); err != nil {
+		t.Fatalf("ApplyScanResult (sin evento): %v", err)
+	}
+	var noEventID sql.NullString
+	if err := s.DB.QueryRow(
+		`SELECT event_id FROM evidence WHERE raw_output_ref = '/tmp/scan2.xml'`,
+	).Scan(&noEventID); err != nil {
+		t.Fatalf("query evidence.event_id (sin evento): %v", err)
+	}
+	if noEventID.Valid {
+		t.Errorf("evidence.event_id = %q, want NULL cuando no se pasó eventID", noEventID.String)
 	}
 }
 
