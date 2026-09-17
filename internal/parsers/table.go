@@ -125,9 +125,23 @@ func ExtractFromGenericTable(content []byte) (ScanResult, bool) {
 		}
 	}
 
+	// Un host solo se reporta si tiene al menos un service asociado — una IP
+	// mencionada de paso en texto libre (ej. "connect to [10.10.15.77] from
+	// ... 50980" en la transcripción de una reverse shell, donde 10.10.15.77
+	// es la IP del propio atacante, no del target) nunca debe convertirse en
+	// una entidad host "confirmed" solo por aparecer junto a un número.
+	// Bug real encontrado validando ExitOne contra HTB Nexus: sin este
+	// filtro, la IP de la VPN del operador terminaba con su propio
+	// initial_discovery objective abierto, como si fuera parte del target.
+	hostsWithService := map[string]bool{}
+	for _, sv := range services {
+		hostsWithService[sv.HostAddress] = true
+	}
 	result := ScanResult{Services: services, Endpoints: endpoints}
 	for _, h := range hosts {
-		result.Hosts = append(result.Hosts, *h)
+		if hostsWithService[h.Address] {
+			result.Hosts = append(result.Hosts, *h)
+		}
 	}
 	return result, !result.Empty()
 }

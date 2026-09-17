@@ -150,6 +150,14 @@ func candidateTargetHost(s *store.Store, candidateID string) string {
 			JOIN hypothesis h ON h.id = c.hypothesis_id
 			WHERE c.id = ?`, candidateID).Scan(&entityID)
 	}
+	if err != nil {
+		err = s.DB.QueryRow(`
+			SELECT cb.ref_id FROM candidate_basis cb
+			JOIN entity e ON e.id = cb.ref_id
+			WHERE cb.candidate_id = ? AND cb.ref_type = 'entity'
+			ORDER BY CASE e.type WHEN 'host' THEN 0 WHEN 'service' THEN 1 ELSE 2 END
+			LIMIT 1`, candidateID).Scan(&entityID)
+	}
 	if err != nil || entityID == "" {
 		return ""
 	}
@@ -163,10 +171,13 @@ func candidateTargetHost(s *store.Store, candidateID string) string {
 	}
 
 	var hostAddr string
-	s.DB.QueryRow(`
+	err = s.DB.QueryRow(`
 		SELECT h.canonical_value FROM relationship r
 		JOIN entity h ON h.id = r.source_entity_id
 		WHERE r.target_entity_id = ? AND r.kind = 'HAS_SERVICE'`, entityID).Scan(&hostAddr)
+	if err != nil && (etype == "domain" || etype == "hostname") {
+		return value
+	}
 	return hostAddr
 }
 

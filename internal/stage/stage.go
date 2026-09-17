@@ -41,11 +41,30 @@ func Estimate(s *store.Store, sessionID string) ([]Stage, error) {
 	}
 	switch {
 	case serviceCount == 0:
-		stages = append(stages, Stage{"surface_discovery", NotStarted, "0 entidades type=service en la sesión"})
+		stages = append(stages, Stage{"discovery", NotStarted, "0 entidades type=service en la sesión"})
 	case initialDiscoveryAnswered:
-		stages = append(stages, Stage{"surface_discovery", Sufficient, "objective 'initial_discovery' respondido y hay entidades de servicio"})
+		stages = append(stages, Stage{"discovery", Sufficient, "objective 'initial_discovery' respondido y hay entidades de servicio"})
 	default:
-		stages = append(stages, Stage{"surface_discovery", Active, "hay entidades de servicio pero el objective de descubrimiento sigue abierto"})
+		stages = append(stages, Stage{"discovery", Active, "hay servicios observados y preguntas de descubrimiento todavía abiertas"})
+	}
+
+	openEnumeration, err := count(s, `SELECT COUNT(*) FROM methodology_objective WHERE session_id = ? AND phase_key = 'enumeration' AND status = 'open'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	answeredEnumeration, err := count(s, `SELECT COUNT(*) FROM methodology_objective WHERE session_id = ? AND phase_key = 'enumeration' AND status = 'answered'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case openEnumeration == 0 && answeredEnumeration == 0:
+		stages = append(stages, Stage{"enumeration", NotStarted, "ningún servicio o dominio abrió preguntas de enumeración"})
+	case openEnumeration == 0:
+		stages = append(stages, Stage{"enumeration", Sufficient, fmtCount("%d objective(s) de enumeración respondidos", answeredEnumeration, 0)})
+	case answeredEnumeration > 0:
+		stages = append(stages, Stage{"enumeration", Partial, fmt.Sprintf("%d objective(s) respondidos y %d abiertos", answeredEnumeration, openEnumeration)})
+	default:
+		stages = append(stages, Stage{"enumeration", Active, fmtCount("%d objective(s) de enumeración abiertos", openEnumeration, 0)})
 	}
 
 	fingerprintedCount, err := count(s, `
@@ -56,60 +75,16 @@ func Estimate(s *store.Store, sessionID string) ([]Stage, error) {
 	}
 	switch {
 	case serviceCount == 0:
-		stages = append(stages, Stage{"service_fingerprinting", NotStarted, "no hay servicios que fingerprintear todavía"})
+		stages = append(stages, Stage{"analysis", NotStarted, "no hay servicios ni relaciones que analizar todavía"})
 	case fingerprintedCount == 0:
-		stages = append(stages, Stage{"service_fingerprinting", NotStarted, "servicios conocidos pero sin versión/producto identificado (0 con attrs.product)"})
+		stages = append(stages, Stage{"analysis", Active, "hay servicios conocidos pero ninguna versión/producto confirmado"})
 	case fingerprintedCount < serviceCount:
-		stages = append(stages, Stage{"service_fingerprinting", Partial, fmtCount("%d de %d servicios tienen producto/versión identificado", fingerprintedCount, serviceCount)})
+		stages = append(stages, Stage{"analysis", Partial, fmtCount("%d de %d servicios tienen producto/versión identificado", fingerprintedCount, serviceCount)})
 	default:
-		stages = append(stages, Stage{"service_fingerprinting", Sufficient, "todos los servicios conocidos tienen producto/versión identificado"})
+		stages = append(stages, Stage{"analysis", Sufficient, "todos los servicios conocidos tienen producto/versión identificado; los gaps adicionales siguen en objectives"})
 	}
 
-	httpObjectiveExists, err := objectiveExists(s, sessionID, "http_enumeration")
-	if err != nil {
-		return nil, err
-	}
-	httpActionCount, err := count(s, `
-		SELECT COUNT(*) FROM action a
-		JOIN candidate c ON c.id = a.candidate_id
-		WHERE c.session_id = ? AND (c.intent_key LIKE 'http_%' OR c.tool IN ('curl','whatweb','ffuf','gobuster'))`,
-		sessionID)
-	if err != nil {
-		return nil, err
-	}
-	// endpointCount: el extractor genérico de dirb/gobuster/ffuf (ver
-	// internal/parsers, internal/methodology.EvaluateEndpointTriggers) crea
-	// entity(type='endpoint') sin pasar por el flujo action/candidate — antes
-	// de esto, http_mapping se quedaba en NOT_STARTED aunque el operador ya
-	// hubiera enumerado endpoints reales, porque solo miraba `action`.
-	endpointCount, err := count(s, `SELECT COUNT(*) FROM entity WHERE session_id = ? AND type = 'endpoint'`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	switch {
-	case !httpObjectiveExists:
-		stages = append(stages, Stage{"http_mapping", NotStarted, "no se ha descubierto ningún servicio HTTP/HTTPS"})
-	case httpActionCount == 0 && endpointCount == 0:
-		stages = append(stages, Stage{"http_mapping", NotStarted, "objective http_enumeration abierto pero sin ninguna acción ni endpoint descubierto todavía"})
-	case httpActionCount == 0:
-		stages = append(stages, Stage{"http_mapping", Active, fmtCount("%d endpoint(s) descubierto(s) (dirb/ffuf/gobuster), sin acción de seguimiento registrada aún", endpointCount, 0)})
-	default:
-		stages = append(stages, Stage{"http_mapping", Active, fmtCount("%d acción(es) HTTP registradas", httpActionCount, 0)})
-	}
-
-	identityCount, err := count(s, `SELECT COUNT(*) FROM entity WHERE session_id = ? AND type = 'identity'`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	if identityCount == 0 {
-		stages = append(stages, Stage{"identity_discovery", NotStarted, "0 entidades type=identity"})
-	} else {
-		stages = append(stages, Stage{"identity_discovery", Active, fmtCount("%d identidad(es) conocida(s)", identityCount, 0)})
-	}
-
-	authActionCount, err := count(s, `
-		SELECT COUNT(*) FROM action a JOIN candidate c ON c.id = a.candidate_id
-		WHERE c.session_id = ? AND c.intent_key = 'test_ssh_auth'`, sessionID)
+	hypothesisCount, err := count(s, `SELECT COUNT(*) FROM hypothesis WHERE session_id = ?`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -119,18 +94,93 @@ func Estimate(s *store.Store, sessionID string) ([]Stage, error) {
 	}
 	switch {
 	case reopenedHypCount > 0:
-		stages = append(stages, Stage{"authentication", Reopened, fmtCount("%d hipótesis de autenticación reabierta(s) por evidencia estructural nueva", reopenedHypCount, 0)})
-	case authActionCount == 0:
-		stages = append(stages, Stage{"authentication", NotStarted, "0 acciones test_ssh_auth ejecutadas"})
+		stages = append(stages, Stage{"hypotheses", Reopened, fmtCount("%d hipótesis reabierta(s) por contradicción nueva", reopenedHypCount, 0)})
+	case hypothesisCount == 0:
+		stages = append(stages, Stage{"hypotheses", NotStarted, "no hay hipótesis falsables registradas"})
 	default:
-		stages = append(stages, Stage{"authentication", Active, fmtCount("%d intento(s) de autenticación registrados", authActionCount, 0)})
+		stages = append(stages, Stage{"hypotheses", Active, fmtCount("%d hipótesis registradas", hypothesisCount, 0)})
 	}
 
-	// initial_access: ExitOne no modela todavía obtención de shell/acceso —
-	// esto queda fuera del alcance actual del Methodology Model (honesto,
-	// no se infiere de ninguna evidencia porque no hay evidencia que ExitOne
-	// sepa interpretar como "acceso obtenido").
-	stages = append(stages, Stage{"initial_access", NotStarted, "ExitOne no tiene todavía una metodología para acceso inicial/explotación (fuera del alcance actual)"})
+	validationActions, err := count(s, `SELECT COUNT(*) FROM action a JOIN candidate c ON c.id = a.candidate_id WHERE c.session_id = ? AND c.phase_key = 'validation'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	// Confirmar o refutar una hipótesis ES el acto de validación (probar algo
+	// falsable y cerrarlo con evidencia) — no solo un candidate aceptado con
+	// phase_key='validation'. Bug real encontrado validando ExitOne contra
+	// HTB Nexus: toda la fase de validación real (probar login SSH con la
+	// password filtrada en git, confirmar el login al CRM, etc.) se hizo
+	// operando directamente contra el target y cerrando la hipótesis con
+	// `hypothesis confirm`/`refute` — nunca se pasó por el loop
+	// next→accept→resolve, así que 0 acciones con ese phase_key no significa
+	// "no se validó nada", solo que no se validó POR ESE camino en particular.
+	closedHypotheses, err := count(s, `SELECT COUNT(*) FROM hypothesis WHERE session_id = ? AND status IN ('confirmed','refuted')`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case validationActions == 0 && closedHypotheses == 0:
+		stages = append(stages, Stage{"validation", NotStarted, "0 acciones de validación y 0 hipótesis confirmadas/refutadas"})
+	default:
+		stages = append(stages, Stage{"validation", Active, fmt.Sprintf("%d acción(es) de validación observadas, %d hipótesis confirmada(s)/refutada(s)", validationActions, closedHypotheses)})
+	}
+
+	exploitationCandidates, err := count(s, `SELECT COUNT(*) FROM candidate WHERE session_id = ? AND phase_key = 'exploitation_guidance'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	// Mismo principio: un hallazgo ya CONFIRMADO de severidad alta/crítica es
+	// evidencia directa de que se llegó a explotar algo, independientemente
+	// de si ExitOne llegó a proponer un candidate de esa fase primero. La
+	// severidad es un campo explícito fijado por el operador al confirmar
+	// (`hypothesis confirm --severity`), nunca inferido de texto libre.
+	confirmedExploits, err := count(s, `SELECT COUNT(*) FROM hypothesis WHERE session_id = ? AND status = 'confirmed' AND severity IN ('critical','high')`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case exploitationCandidates == 0 && confirmedExploits == 0:
+		stages = append(stages, Stage{"exploitation_guidance", NotStarted, "ninguna dirección de explotación respaldada por el estado actual"})
+	default:
+		stages = append(stages, Stage{"exploitation_guidance", Active, fmt.Sprintf("%d candidato(s) de guía de explotación; %d hallazgo(s) crítico(s)/alto(s) ya confirmados; ejecución siempre humana", exploitationCandidates, confirmedExploits)})
+	}
+
+	accessCount, err := count(s, `SELECT COUNT(*) FROM entity WHERE session_id = ? AND type IN ('access_context','principal')`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if accessCount == 0 {
+		stages = append(stages, Stage{"post_access", NotStarted, "no existe evidencia confirmada de un contexto de acceso"})
+	} else {
+		stages = append(stages, Stage{"post_access", Active, fmtCount("%d contexto(s) de acceso/principal observados", accessCount, 0)})
+	}
+
+	privilegeCount, err := count(s, `SELECT COUNT(*) FROM entity WHERE session_id = ? AND type = 'privilege'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if privilegeCount == 0 {
+		stages = append(stages, Stage{"privilege_access", NotStarted, "no hay capacidades o privilegios confirmados que analizar"})
+	} else {
+		stages = append(stages, Stage{"privilege_access", Active, fmtCount("%d capacidad(es)/privilegio(s) observados", privilegeCount, 0)})
+	}
+
+	openObjectives, err := count(s, `SELECT COUNT(*) FROM operator_objective WHERE session_id = ? AND status = 'open'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	completedObjectives, err := count(s, `SELECT COUNT(*) FROM operator_objective WHERE session_id = ? AND status = 'completed'`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case openObjectives == 0 && completedObjectives == 0:
+		stages = append(stages, Stage{"objectives", NotStarted, "el operador todavía no definió un objetivo final"})
+	case openObjectives == 0:
+		stages = append(stages, Stage{"objectives", Sufficient, fmtCount("%d objetivo(s) completados con cierre explícito", completedObjectives, 0)})
+	default:
+		stages = append(stages, Stage{"objectives", Active, fmt.Sprintf("%d objetivo(s) abiertos; %d completados", openObjectives, completedObjectives)})
+	}
 
 	return stages, nil
 }

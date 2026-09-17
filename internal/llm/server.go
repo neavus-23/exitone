@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -28,8 +27,8 @@ func llmDir() string {
 		home = "."
 	}
 	dir := filepath.Join(home, ".exitone", "llm")
-	os.MkdirAll(filepath.Join(dir, "bin"), 0o755)
-	os.MkdirAll(filepath.Join(dir, "models"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "bin"), 0o700)
+	os.MkdirAll(filepath.Join(dir, "models"), 0o700)
 	return dir
 }
 
@@ -99,16 +98,22 @@ func waitForHealth(ctx context.Context, baseURL string, timeout time.Duration) e
 // subproceso efímero atado a un comando puntual.
 func spawnServer(bin, model, port string) error {
 	dir := llmDir()
-	logFile, err := os.OpenFile(filepath.Join(dir, "server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(filepath.Join(dir, "server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return fmt.Errorf("abrir log del LLM: %w", err)
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(bin, "-m", model, "--port", port, "-c", "4096")
+	// -c 8192: 4096 no alcanzaba para el caso real de una transcripción de
+	// shell larga (system prompt con ejemplos + ~4000 caracteres de output
+	// crudo) — "Context size has been exceeded" al ingerir la evidencia real
+	// de la escalada a root de HTB Nexus. El proceso queda con margen de
+	// sobra en una VM de 8GB (~3.7GB libres, el KV cache extra de un modelo
+	// de 3B a este tamaño de contexto es del orden de cientos de MB).
+	cmd := exec.Command(bin, "-m", model, "--port", port, "-c", "8192")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("arrancar llama-server (%s): %w", bin, err)
 	}

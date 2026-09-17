@@ -22,7 +22,7 @@ func Record(s *store.Store, actionIDPrefix string, res *investigation.IngestResu
 	var actionID string
 	var objectivePathID sql.NullString
 	err := s.DB.QueryRow(
-		`SELECT id, objective_path_id FROM action WHERE id LIKE ? || '%' ORDER BY executed_at DESC LIMIT 1`,
+		`SELECT id, objective_path_id FROM action WHERE id LIKE ? || '%' ORDER BY COALESCE(executed_at, decided_at) DESC LIMIT 1`,
 		actionIDPrefix,
 	).Scan(&actionID, &objectivePathID)
 	if err == sql.ErrNoRows {
@@ -42,21 +42,61 @@ func Record(s *store.Store, actionIDPrefix string, res *investigation.IngestResu
 // qué acción cerrar, en vez de dejar el objective_path abierto y hacer que
 // ExitOne vuelva a sugerir un comando ya ejecutado.
 //
-// Limitación conocida y documentada: si hubiera dos acciones de la MISMA
-// herramienta esperando evidencia simultáneamente en la misma sesión, esto
-// resuelve la más reciente — puede no ser la correcta. Para ese caso, sigue
-// existiendo `--for-action` explícito como vía de desambiguación.
+// Si hay más de una acción de la misma herramienta no elige arbitrariamente:
+// devuelve matched=false y conserva `--for-action` como vía explícita.
 func AutoRecordPending(s *store.Store, sessionID, tool string, res *investigation.IngestResult, pathResolved bool) (matched bool, outcomeID string, err error) {
-	var actionID string
-	var objectivePathID sql.NullString
-	err = s.DB.QueryRow(`
+	rows, err := s.DB.Query(`
 		SELECT a.id, a.objective_path_id
 		FROM action a
 		JOIN candidate c ON c.id = a.candidate_id
 		WHERE c.session_id = ? AND c.tool = ? AND a.status = 'awaiting_evidence'
-		ORDER BY a.executed_at DESC LIMIT 1`,
+		ORDER BY COALESCE(a.executed_at, a.decided_at) DESC LIMIT 2`,
 		sessionID, tool,
-	).Scan(&actionID, &objectivePathID)
+	)
+	if err != nil {
+		return false, "", err
+	}
+	defer rows.Close()
+	type pending struct {
+		id     string
+		pathID sql.NullString
+	}
+	var found []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.pathID); err != nil {
+			return false, "", err
+		}
+		found = append(found, p)
+	}
+	if err := rows.Err(); err != nil {
+		return false, "", err
+	}
+	if len(found) != 1 {
+		return false, "", nil
+	}
+	id, err := recordFor(s, found[0].id, found[0].pathID, res, pathResolved)
+	if err != nil {
+		return false, "", err
+	}
+	return true, id, nil
+}
+
+// AutoRecordForEvent es el camino preciso para la auto-ingesta: el hook ya
+// entregó el mismo evento que se vinculó a la acción al observar el comando.
+// Si no hay vínculo (comando manual/no modelado) devuelve matched=false y el
+// llamador puede usar el fallback por herramienta.
+func AutoRecordForEvent(s *store.Store, eventID string, res *investigation.IngestResult, pathResolved bool) (matched bool, outcomeID string, err error) {
+	if eventID == "" {
+		return false, "", nil
+	}
+	var actionID string
+	var objectivePathID sql.NullString
+	err = s.DB.QueryRow(`
+		SELECT a.id, a.objective_path_id
+		FROM action_event ae JOIN action a ON a.id = ae.action_id
+		WHERE ae.event_id = ? AND a.status IN ('executed','awaiting_evidence')
+		LIMIT 1`, eventID).Scan(&actionID, &objectivePathID)
 	if err == sql.ErrNoRows {
 		return false, "", nil
 	}
@@ -91,7 +131,7 @@ func recordFor(s *store.Store, actionID string, objectivePathID sql.NullString, 
 	); err != nil {
 		return "", fmt.Errorf("insert outcome: %w", err)
 	}
-	if _, err := s.DB.Exec(`UPDATE action SET status = 'resolved' WHERE id = ?`, actionID); err != nil {
+	if _, err := s.DB.Exec(`UPDATE action SET status = 'resolved', executed_at = COALESCE(executed_at, ?) WHERE id = ?`, now, actionID); err != nil {
 		return "", fmt.Errorf("mark action resolved: %w", err)
 	}
 
@@ -130,7 +170,7 @@ func RecordManualResult(s *store.Store, actionIDPrefix, result string) (actionID
 
 	var objectivePathID sql.NullString
 	err = s.DB.QueryRow(
-		`SELECT id, objective_path_id FROM action WHERE id LIKE ? || '%' ORDER BY executed_at DESC LIMIT 1`,
+		`SELECT id, objective_path_id FROM action WHERE id LIKE ? || '%' ORDER BY COALESCE(executed_at, decided_at) DESC LIMIT 1`,
 		actionIDPrefix,
 	).Scan(&actionID, &objectivePathID)
 	if err == sql.ErrNoRows {
@@ -157,7 +197,7 @@ func RecordManualResult(s *store.Store, actionIDPrefix, result string) (actionID
 	); err != nil {
 		return "", fmt.Errorf("insert outcome: %w", err)
 	}
-	if _, err := s.DB.Exec(`UPDATE action SET status = 'resolved' WHERE id = ?`, actionID); err != nil {
+	if _, err := s.DB.Exec(`UPDATE action SET status = 'resolved', executed_at = COALESCE(executed_at, ?) WHERE id = ?`, now, actionID); err != nil {
 		return "", fmt.Errorf("mark action resolved: %w", err)
 	}
 	if pathResolved && objectivePathID.Valid {

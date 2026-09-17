@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS session (
     id TEXT PRIMARY KEY,
     target_label TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    closed_at TEXT
+    closed_at TEXT,
+    state_revision INTEGER NOT NULL DEFAULT 0
 );
 
 -- Comando ejecutado directamente en el shell (via shell hooks). Ver también
@@ -24,7 +25,10 @@ CREATE TABLE IF NOT EXISTS event (
     started_at TEXT,
     ended_at TEXT,
     exit_code INTEGER,
-    source TEXT NOT NULL DEFAULT 'shell_hook' -- shell_hook | manual_ingest | pipe_pane
+    source TEXT NOT NULL DEFAULT 'shell_hook', -- shell_hook | manual_ingest | pipe_pane
+    fingerprint TEXT,
+    link_status TEXT NOT NULL DEFAULT 'unmatched', -- unmatched | matched | ambiguous
+    UNIQUE(session_id, fingerprint)
 );
 
 CREATE TABLE IF NOT EXISTS evidence (
@@ -80,7 +84,8 @@ CREATE TABLE IF NOT EXISTS methodology_objective (
     intent_key TEXT NOT NULL, -- ej. smb_enumeration
     trigger_entity_id TEXT NOT NULL REFERENCES entity(id),
     status TEXT NOT NULL DEFAULT 'open', -- open | answered
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    phase_key TEXT NOT NULL DEFAULT 'enumeration'
 );
 
 -- Caminos alternativos por objective (sección F, punto 6 del changelog: sin bloqueo rígido).
@@ -108,7 +113,23 @@ CREATE TABLE IF NOT EXISTS candidate (
     explanation TEXT NOT NULL,
     created_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'proposed', -- proposed | accepted | dismissed
-    hypothesis_id TEXT REFERENCES hypothesis(id) -- solo para candidatos source='reopening'
+    hypothesis_id TEXT REFERENCES hypothesis(id), -- solo para candidatos source='reopening'
+    kind TEXT NOT NULL DEFAULT 'command', -- direction | technique | command
+    phase_key TEXT NOT NULL DEFAULT 'enumeration',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    risk_level TEXT NOT NULL DEFAULT 'low', -- low | medium | high | critical
+    expected_evidence TEXT NOT NULL DEFAULT '',
+    assumptions TEXT NOT NULL DEFAULT '[]',
+    state_revision INTEGER NOT NULL DEFAULT 0,
+    fingerprint TEXT
+);
+
+CREATE TABLE IF NOT EXISTS candidate_basis (
+    candidate_id TEXT NOT NULL REFERENCES candidate(id) ON DELETE CASCADE,
+    ref_type TEXT NOT NULL, -- evidence | observation | entity | hypothesis | objective | outcome
+    ref_id TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'supports',
+    PRIMARY KEY(candidate_id, ref_type, ref_id, role)
 );
 
 -- Hipótesis (sección D1/8): una conclusión provisional, cerrada a partir de
@@ -130,7 +151,14 @@ CREATE TABLE IF NOT EXISTS hypothesis (
     status TEXT NOT NULL DEFAULT 'untested',
     confidence REAL NOT NULL DEFAULT 1.0,
     opened_at TEXT NOT NULL,
-    closed_at TEXT
+    closed_at TEXT,
+    -- Detalle de hallazgo (sección "Persistencia y documentación" del pedido:
+    -- el reporte final necesita severidad y remediación reales, nunca
+    -- redactadas libremente por el LLM). Se fijan explícitamente al cerrar
+    -- con `hypothesis confirm/refute`, nunca inferidos.
+    severity TEXT NOT NULL DEFAULT '', -- '' | low | medium | high | critical
+    remediation TEXT NOT NULL DEFAULT '',
+    evidence_note TEXT NOT NULL DEFAULT '' -- prueba de impacto (ej. flag, output puntual)
 );
 
 -- Provenance de una hipótesis al nivel correcto: una OBSERVATION concreta
@@ -164,8 +192,15 @@ CREATE TABLE IF NOT EXISTS action (
     id TEXT PRIMARY KEY,
     candidate_id TEXT NOT NULL REFERENCES candidate(id),
     objective_path_id TEXT REFERENCES objective_path(id),
-    executed_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'awaiting_evidence'
+    decided_at TEXT,
+    executed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'planned' -- planned | executed | awaiting_evidence | resolved
+);
+
+CREATE TABLE IF NOT EXISTS action_event (
+    action_id TEXT NOT NULL REFERENCES action(id) ON DELETE CASCADE,
+    event_id TEXT NOT NULL REFERENCES event(id) ON DELETE CASCADE,
+    PRIMARY KEY(action_id, event_id)
 );
 
 -- Asunciones registradas en el momento de ejecutar la acción (sección D1 —
@@ -213,6 +248,61 @@ CREATE TABLE IF NOT EXISTS focus (
     ref_type   TEXT NOT NULL, -- hypothesis | objective (ver plan N.5 sobre alcance)
     ref_id     TEXT NOT NULL,
     set_at     TEXT NOT NULL
+);
+
+-- El operador puede fijar objetivos finales sin convertirlos en facts ni
+-- mezclarlos con objectives abiertos automáticamente por metodología.
+CREATE TABLE IF NOT EXISTS operator_objective (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES session(id),
+    statement TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open', -- open | completed | abandoned
+    evidence_ref TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+-- Credenciales locales. `secret_value` se guarda en texto por decisión
+-- explícita del operador; todos los consumidores deben enmascararlo salvo
+-- que se solicite --reveal.
+CREATE TABLE IF NOT EXISTS credential (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES session(id),
+    identity_entity_id TEXT REFERENCES entity(id),
+    service_entity_id TEXT REFERENCES entity(id),
+    secret_value TEXT NOT NULL,
+    secret_fingerprint TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'discovered', -- discovered | valid | invalid | stale
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, secret_fingerprint, identity_entity_id, service_entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS credential_attempt (
+    id TEXT PRIMARY KEY,
+    credential_id TEXT NOT NULL REFERENCES credential(id) ON DELETE CASCADE,
+    service_entity_id TEXT REFERENCES entity(id),
+    event_id TEXT REFERENCES event(id),
+    result TEXT NOT NULL, -- success | fail | unknown
+    attempted_at TEXT NOT NULL
+);
+
+-- Un solo trabajo de exploración vigente por sesión. Una ingesta nueva
+-- reemplaza la revisión pendiente anterior; el worker descarta resultados
+-- si la revisión cambia mientras el LLM está razonando.
+CREATE TABLE IF NOT EXISTS strategy_job (
+    session_id TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | running | completed | failed | stale
+    last_error TEXT NOT NULL DEFAULT '',
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS schema_migration (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
 );
 
 -- Scope tracking (flujo bug-bounty / pentest con reglas de compromiso): qué

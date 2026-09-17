@@ -87,19 +87,19 @@ var commandDefinitions = []commandDefinition{
 	}, Handler: handleNext},
 	{Spec: console.CommandSpec{
 		Name: "why", Category: "Strategy",
-		Usage: "why <candidate-id-prefix>", Description: "explicar por qué se sugirió un candidato",
+		Usage: "why [candidate-id-prefix]", Description: "explicar por qué se sugirió un candidato — sin ID, explica el único candidato pendiente si hay exactamente uno",
 	}, Handler: legacyAdapter("why")},
 	{Spec: console.CommandSpec{
 		Name: "accept", Category: "Strategy",
-		Usage: "accept <candidate-id-prefix>", Description: "aceptar un candidato — registra la acción, NO la ejecuta",
+		Usage: "accept [candidate-id-prefix]", Description: "aceptar un candidato — registra la acción, NO la ejecuta; sin ID, solo si hay exactamente uno pendiente",
 	}, Handler: handleAccept},
 	{Spec: console.CommandSpec{
 		Name: "resolve", Category: "Strategy",
-		Usage: "resolve <action-id-prefix> --result fail|success", Description: "cerrar/confirmar una hipótesis tras probar algo",
+		Usage: "resolve [action-id-prefix] --result fail|success", Description: "cerrar/confirmar una hipótesis tras probar algo — sin ID, solo si hay exactamente una acción pendiente de resultado",
 	}, Handler: legacyAdapter("resolve")},
 	{Spec: console.CommandSpec{
 		Name: "dismiss", Category: "Strategy",
-		Usage: "dismiss <candidate-id-prefix>", Description: "descartar una sugerencia obsoleta",
+		Usage: "dismiss [candidate-id-prefix]", Description: "descartar una sugerencia obsoleta — sin ID, solo si hay exactamente una pendiente",
 	}, Handler: legacyAdapter("dismiss")},
 	{Spec: console.CommandSpec{
 		Name: "focus", Category: "Strategy",
@@ -124,6 +124,22 @@ var commandDefinitions = []commandDefinition{
 		Usage: "ingest <archivo> [--tool <hint>] [--host <ip>]", Description: "ingerir evidencia manualmente",
 	}, Handler: legacyAdapter("ingest")},
 	{Spec: console.CommandSpec{
+		Name: "credential", Aliases: []string{"credentials"}, Category: "Evidence", Sensitive: true,
+		Usage: "credential <add|list|attempt|update> [id]", Description: "recordar credenciales e intentos; valores enmascarados salvo --reveal — attempt/update sin ID, solo si hay exactamente una credencial",
+	}, Handler: legacyAdapter("credential")},
+	{Spec: console.CommandSpec{
+		Name: "observation", Aliases: []string{"observations"}, Category: "Evidence",
+		Usage: "observation <list|confirm|reject> [id]", Description: "revisar observaciones candidatas del LLM — confirm/reject sin ID, solo si hay exactamente una pendiente",
+	}, Handler: legacyAdapter("observation")},
+	{Spec: console.CommandSpec{
+		Name: "hypothesis", Category: "Strategy",
+		Usage: "hypothesis <list|open|support|contradict|confirm|refute> ...", Description: "ciclo explícito de hipótesis falsables — confirm/refute/support/contradict sin ID, solo si hay exactamente una elegible",
+	}, Handler: legacyAdapter("hypothesis")},
+	{Spec: console.CommandSpec{
+		Name: "objective", Aliases: []string{"objectives"}, Category: "Strategy",
+		Usage: "objective <list|add|complete|abandon> [id]", Description: "objetivos finales definidos por el operador — complete/abandon sin ID, solo si hay exactamente uno abierto",
+	}, Handler: legacyAdapter("objective")},
+	{Spec: console.CommandSpec{
 		Name: "ask", Category: "Evidence",
 		Usage: "ask \"<pregunta>\"", Description: "consulta en lenguaje natural anclada al estado real",
 	}, Handler: legacyAdapter("ask")},
@@ -132,9 +148,18 @@ var commandDefinitions = []commandDefinition{
 		Usage: "status", Description: "estado completo: entidades, relaciones, objectives",
 	}, Handler: legacyAdapter("status")},
 	{Spec: console.CommandSpec{
+		Name: "events", Category: "Evidence",
+		Usage: "events [--tail N]", Description: "eventos recientes y asociación automática con acciones",
+	}, Handler: legacyAdapter("events")},
+	{Spec: console.CommandSpec{
 		Name: "stages", Category: "Evidence",
 		Usage: "stages", Description: "etapas de la investigación (NOT_STARTED/ACTIVE/...)",
 	}, Handler: legacyAdapter("stages")},
+	{Spec: console.CommandSpec{
+		Name: "report", Category: "Evidence",
+		Usage:       "report [--reveal] [--raw] [--out <archivo>]",
+		Description: "informe final redactado por el LLM a partir de datos reales (--raw: versión determinista sin redactar)",
+	}, Handler: legacyAdapter("report")},
 
 	{Spec: console.CommandSpec{
 		Name: "watch", Category: "Terminal",
@@ -142,11 +167,13 @@ var commandDefinitions = []commandDefinition{
 	}, Handler: subprocessAdapter("watch")},
 	{Spec: console.CommandSpec{
 		Name: "start", Category: "Terminal",
-		Usage: "start <target> [--tmux]", Description: "terminal embebida + dashboard en vivo (subproceso)",
+		Usage:       "start [target] [--tmux] [--session-name <nombre>] [--detach]",
+		Description: "terminal embebida (subproceso) — sin target, la TUI pregunta qué workspace usar/crear; --tmux requiere target, layout legacy",
 	}, Handler: subprocessAdapter("start")},
 	{Spec: console.CommandSpec{
 		Name: "tui", Category: "Terminal",
-		Usage: "tui", Description: "la app completa directamente (subproceso)",
+		Usage:       "tui",
+		Description: "la app completa directamente (subproceso) — si no hay workspace activo, primero pregunta cuál usar/crear (mismo onboarding que `start` sin target)",
 	}, Handler: subprocessAdapter("tui")},
 }
 
@@ -154,13 +181,21 @@ var commandDefinitions = []commandDefinition{
 // hypotheses/coverage como atajos directos de `show ...`.
 var aliasCommandDefinitions = []commandDefinition{
 	{Spec: console.CommandSpec{Name: "hosts", Category: "Navigation", Usage: "hosts", Description: "alias de: show hosts"},
-		Handler: func(cs *ConsoleSession, args []string) error { return handleShow(cs, append([]string{"hosts"}, args...)) }},
+		Handler: func(cs *ConsoleSession, args []string) error {
+			return handleShow(cs, append([]string{"hosts"}, args...))
+		}},
 	{Spec: console.CommandSpec{Name: "services", Category: "Navigation", Usage: "services", Description: "alias de: show services"},
-		Handler: func(cs *ConsoleSession, args []string) error { return handleShow(cs, append([]string{"services"}, args...)) }},
+		Handler: func(cs *ConsoleSession, args []string) error {
+			return handleShow(cs, append([]string{"services"}, args...))
+		}},
 	{Spec: console.CommandSpec{Name: "hypotheses", Category: "Navigation", Usage: "hypotheses", Description: "alias de: show hypotheses"},
-		Handler: func(cs *ConsoleSession, args []string) error { return handleShow(cs, append([]string{"hypotheses"}, args...)) }},
+		Handler: func(cs *ConsoleSession, args []string) error {
+			return handleShow(cs, append([]string{"hypotheses"}, args...))
+		}},
 	{Spec: console.CommandSpec{Name: "coverage", Category: "Navigation", Usage: "coverage", Description: "alias de: show coverage"},
-		Handler: func(cs *ConsoleSession, args []string) error { return handleShow(cs, append([]string{"coverage"}, args...)) }},
+		Handler: func(cs *ConsoleSession, args []string) error {
+			return handleShow(cs, append([]string{"coverage"}, args...))
+		}},
 }
 
 // buildConsole arma Registry+handlers desde el ÚNICO slice de arriba —

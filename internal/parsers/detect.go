@@ -15,6 +15,7 @@ package parsers
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -77,6 +78,10 @@ const (
 // específico. XML/JSON se detectan por su primer token no-whitespace; la
 // tabla genérica se detecta por presencia de tokens con forma de
 // dirección/puerto, sin exigir encabezados literales de ninguna herramienta.
+//
+// Antes de intentar tabla genérica se descarta explícitamente la forma
+// "transcripción de shell interactiva" (looksLikeShellTranscript) — ver esa
+// función para el bug real que motivó este orden.
 func DetectShape(content []byte) Shape {
 	trimmed := strings.TrimSpace(string(content))
 	if trimmed == "" {
@@ -93,10 +98,50 @@ func DetectShape(content []byte) Shape {
 	if (first == '{' || first == '[') && json.Valid(content) {
 		return ShapeJSON
 	}
+	if looksLikeShellTranscript(trimmed) {
+		return ShapeUnknown
+	}
 	if looksLikeGenericTable(trimmed) {
 		return ShapeGenericTable
 	}
 	return ShapeUnknown
+}
+
+// looksLikeShellTranscript reconoce una transcripción de sesión de shell
+// interactiva (múltiples comandos tecleados por el operador, no la salida de
+// una sola herramienta de escaneo) — nunca debe clasificarse como tabla
+// genérica aunque contenga, de paso, un par IP:puerto o una URL con código
+// de estado (ej. el print de un script de prueba de login, o la IP propia
+// del operador en un "connect to [IP] from ..." de una reverse shell).
+//
+// Bug real encontrado validando ExitOne contra HTB Nexus: la transcripción
+// completa de la sesión SSH + escalada de privilegios a root (con el hash
+// real de root.txt, el resultado de `id`, la clave SSH usada, etc.) traía
+// una sola línea de un script Python imprimiendo "status=302
+// http://billing.nexus.htb/admin/login" — suficiente para que
+// looksLikeGenericTable la clasificara entera como ShapeGenericTable. El
+// extractor de tabla se quedó solo con esa URL y descartó TODO lo demás: el
+// acceso a la shell, las credenciales confirmadas, la escalada a root. El
+// archivo nunca llegó al extractor de Nivel 2 (LLM), así que ExitOne nunca
+// registró ninguna entidad access_context/principal/privilege para el post-
+// acceso real que sí ocurrió — el estimador de cobertura (`internal/stage`)
+// se quedó "ciego" a esa fase no porque nadie la hubiera confirmado, sino
+// porque el archivo que la documentaba nunca llegó al único camino capaz de
+// extraerla.
+//
+// La señal usada es la FORMA del archivo (marcador de autocaptura de
+// ExitOne, o múltiples líneas con pinta de prompt de shell), nunca su
+// contenido semántico — consistente con el resto de este paquete.
+var (
+	exitoneCaptureMarker = "[exitone] capturando"
+	shellPromptRe        = regexp.MustCompile(`(?m)^\s*\S+@\S+:\S*[$#%]\s*$|^\s*[\w.-]+@[\w.-]+:\S*[$#%]`)
+)
+
+func looksLikeShellTranscript(s string) bool {
+	if strings.Contains(s, exitoneCaptureMarker) {
+		return true
+	}
+	return len(shellPromptRe.FindAllString(s, 2)) >= 2
 }
 
 func looksLikeGenericTable(s string) bool {

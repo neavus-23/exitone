@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"exitone/internal/scope"
 	"exitone/internal/stage"
 	"exitone/internal/store"
 )
@@ -90,7 +91,7 @@ func printWatchStages(s *store.Store, sessionID string) {
 func printWatchCandidates(s *store.Store, sessionID string) {
 	fmt.Println(colorize(ansiBold+ansiCyan, "PRÓXIMAS SUGERENCIAS (top 5, exitone next)"))
 	rows, err := s.DB.Query(`
-		SELECT source, tool, command_template_rendered, score FROM candidate
+		SELECT id, source, kind, phase_key, risk_level, command_template_rendered, explanation, score FROM candidate
 		WHERE session_id = ? AND status = 'proposed' ORDER BY score DESC LIMIT 5`, sessionID)
 	if err != nil {
 		return
@@ -99,10 +100,18 @@ func printWatchCandidates(s *store.Store, sessionID string) {
 	any := false
 	for rows.Next() {
 		any = true
-		var source, tool, cmd string
+		var id, source, kind, phase, risk, cmd, explanation string
 		var score float64
-		rows.Scan(&source, &tool, &cmd, &score)
-		fmt.Printf("  %s [%s] %s\n", colorize(ansiBold, fmt.Sprintf("%.2f", score)), source, cmd)
+		rows.Scan(&id, &source, &kind, &phase, &risk, &cmd, &explanation, &score)
+		if cmd == "" {
+			cmd = explanation
+		}
+		fmt.Printf("  %s [%s/%s %s risk=%s] %s\n", colorize(ansiBold, fmt.Sprintf("%.2f", score)), source, kind, phase, risk, cmd)
+		if target := candidateTargetHost(s, id); target != "" {
+			if status, pattern, err := scope.Check(s, sessionID, target); err == nil && status == scope.Out {
+				fmt.Printf("    %s\n", colorize(ansiRed+ansiBold, fmt.Sprintf("⚠ SCOPE EXCLUIDO: %s (regla %q)", target, pattern)))
+			}
+		}
 	}
 	if !any {
 		fmt.Println(colorize(ansiGray, "  (ninguna pendiente)"))
@@ -148,7 +157,19 @@ func printWatchObjectives(s *store.Store, sessionID string) {
 // tmux en vez de la terminal embebida.
 func cmdStart(s *store.Store, args []string) {
 	if len(args) < 1 {
-		fatal("uso: exitone start <target-label> [--tmux]")
+		// Sin target: ya no es un error — `cmdTUI` resuelve el workspace
+		// (crear/resumir) en una pantalla de onboarding dentro de la propia
+		// TUI, así "eliminar parámetros obligatorios" no se limita a este
+		// comando. El layout `--tmux` (legacy) queda afuera de esta mejora
+		// a propósito: correr `exitone watch` dentro de un pane de tmux sin
+		// saber todavía qué sesión mostrar no tiene un buen equivalente
+		// simple, y es un camino secundario ya documentado como tal.
+		_, onboardFlags := parseFlags(args)
+		if _, useTmux := onboardFlags["tmux"]; useTmux {
+			fatal("uso: exitone start <target-label> --tmux [--session-name <nombre>] [--detach]")
+		}
+		cmdTUI(s)
+		return
 	}
 	target := args[0]
 	_, flags := parseFlags(args[1:])
@@ -156,7 +177,8 @@ func cmdStart(s *store.Store, args []string) {
 	cmdSession(s, []string{"new", target})
 
 	if _, useTmux := flags["tmux"]; useTmux {
-		startWithTmuxLayout(target)
+		_, detach := flags["detach"]
+		startWithTmuxLayout(target, flags["session-name"], detach)
 		return
 	}
 	cmdTUI(s)
@@ -166,22 +188,39 @@ func cmdStart(s *store.Store, args []string) {
 // mantiene disponible con `--tmux` para quien no quiera la terminal
 // embebida de la TUI (ej. limitaciones del emulador VT con alguna
 // herramienta específica — ver limitaciones conocidas).
-func startWithTmuxLayout(target string) {
+func startWithTmuxLayout(target, overrideName string, detach bool) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		fatal("tmux no está instalado o no está en el PATH")
 	}
-	sessionName := "exitone-" + sanitizeTmuxName(target)
+	sessionName := overrideName
+	if sessionName == "" {
+		sessionName = "exitone-" + sanitizeTmuxName(target)
+	}
+	sessionName = sanitizeTmuxName(sessionName)
 	exists := exec.Command("tmux", "has-session", "-t", sessionName).Run() == nil
 
 	if !exists {
 		runQuiet("tmux", "new-session", "-d", "-s", sessionName, "-n", "work")
 		runQuiet("tmux", "send-keys", "-t", sessionName+":work", "clear", "Enter")
-		runQuiet("tmux", "split-window", "-h", "-t", sessionName+":work")
+		runQuiet("tmux", "split-window", "-h", "-p", "42", "-t", sessionName+":work.0")
 		runQuiet("tmux", "send-keys", "-t", sessionName+":work.1", "exitone watch", "Enter")
+		runQuiet("tmux", "split-window", "-v", "-p", "60", "-t", sessionName+":work.1")
+		runQuiet("tmux", "send-keys", "-t", sessionName+":work.2", "watch -n 2 'exitone events --tail 12'", "Enter")
+		runQuiet("tmux", "split-window", "-v", "-p", "45", "-t", sessionName+":work.2")
+		runQuiet("tmux", "send-keys", "-t", sessionName+":work.3", "umask 077; mkdir -p ~/.exitone; chmod 700 ~/.exitone; touch ~/.exitone/validation.log ~/.exitone/background_ingest.log ~/.exitone/strategy-worker.log; chmod 600 ~/.exitone/validation.log ~/.exitone/background_ingest.log ~/.exitone/strategy-worker.log; tail -F ~/.exitone/validation.log ~/.exitone/background_ingest.log ~/.exitone/strategy-worker.log", "Enter")
+		runQuiet("tmux", "select-pane", "-t", sessionName+":work.0", "-T", "OPERATOR")
+		runQuiet("tmux", "select-pane", "-t", sessionName+":work.1", "-T", "EXITONE LIVE")
+		runQuiet("tmux", "select-pane", "-t", sessionName+":work.2", "-T", "EVIDENCE & EVENTS")
+		runQuiet("tmux", "select-pane", "-t", sessionName+":work.3", "-T", "VALIDATION CONTROL")
+		runQuiet("tmux", "set-option", "-t", sessionName, "pane-border-status", "top")
 		runQuiet("tmux", "select-pane", "-t", sessionName+":work.0")
-		fmt.Println(statusLine("+", ansiGreen, "layout creado: pane izquierdo = tu shell, pane derecho = exitone watch"))
+		fmt.Println(statusLine("+", ansiGreen, "layout observable creado: operator + live + evidence/events + validation control"))
 	} else {
 		fmt.Println(statusLine("*", ansiCyan, "la sesión tmux "+sessionName+" ya existía, reutilizándola"))
+	}
+	if detach {
+		fmt.Printf("Sesión lista en segundo plano. Para verla: tmux attach -t %s\n", sessionName)
+		return
 	}
 
 	if os.Getenv("TMUX") != "" {

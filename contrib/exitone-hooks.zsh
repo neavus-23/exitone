@@ -229,6 +229,11 @@ __exitone_precmd() {
   local event_json
   event_json=$(__exitone_build_event_json "$__exitone_cmd" "$__exitone_cwd" "$__exitone_start_epoch" "$end_epoch" "$exit_code")
 
+  # El EVENTO existe aunque el comando falle o no produzca output suficiente
+  # para ingerir. Esta llamada rápida e idempotente cierra la memoria de lo
+  # ejecutado y enlaza un candidato único antes de procesar su evidencia.
+  exitone observe-event --event "$event_json" >> "$HOME/.exitone/background_ingest.log" 2>&1
+
   if ! __exitone_maybe_autoingest_file "$__exitone_cmd" "$exit_code" "$event_json"; then
     __exitone_maybe_capture_full_output "$__exitone_cmd" "$exit_code" "$event_json"
   fi

@@ -212,7 +212,7 @@ func showHypotheses(cs *ConsoleSession, ctx console.ConsoleContext) error {
 
 func showCandidates(cs *ConsoleSession, ctx console.ConsoleContext) error {
 	rows, err := cs.Store.DB.Query(`
-		SELECT id, score, command_template_rendered, status FROM candidate
+		SELECT id, score, command_template_rendered, explanation, kind, phase_key, risk_level, status FROM candidate
 		WHERE session_id = ? AND status = 'proposed' ORDER BY score DESC`, cs.SessionID)
 	if err != nil {
 		return err
@@ -231,9 +231,9 @@ func showCandidates(cs *ConsoleSession, ctx console.ConsoleContext) error {
 	var table [][]string
 	i := 0
 	for rows.Next() {
-		var id, command, status string
+		var id, command, explanation, kind, phase, risk, status string
 		var score float64
-		if err := rows.Scan(&id, &score, &command, &status); err != nil {
+		if err := rows.Scan(&id, &score, &command, &explanation, &kind, &phase, &risk, &status); err != nil {
 			return err
 		}
 		if related != nil && !related[id] {
@@ -241,11 +241,15 @@ func showCandidates(cs *ConsoleSession, ctx console.ConsoleContext) error {
 		}
 		short := id[:8]
 		hostAddr := candidateTargetHost(cs.Store, id)
-		table = append(table, []string{fmt.Sprintf("%d", i), short, fmt.Sprintf("%.2f", score), truncateText(command, 50), status, scopeLabel(cs, hostAddr)})
+		display := command
+		if display == "" {
+			display = explanation
+		}
+		table = append(table, []string{fmt.Sprintf("%d", i), short, fmt.Sprintf("%.2f", score), kind, phase, risk, truncateText(display, 45), status, scopeLabel(cs, hostAddr)})
 		results = append(results, console.ResultRef{Type: console.Candidate, ID: id, Label: short})
 		i++
 	}
-	fmt.Print(console.RenderTable("Candidates", []string{"#", "ID", "Score", "Command", "Status", "Scope"}, table))
+	fmt.Print(console.RenderTable("Candidates", []string{"#", "ID", "Score", "Kind", "Phase", "Risk", "Suggestion", "Status", "Scope"}, table))
 	cs.Results = results
 	return rows.Err()
 }

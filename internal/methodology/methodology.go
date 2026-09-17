@@ -18,6 +18,7 @@ import (
 
 type objectiveDef struct {
 	IntentKey string
+	PhaseKey  string
 	// Trigger: tipo de entidad + predicado sobre sus attrs.
 	EntityType string
 	Matches    func(attrs map[string]any) bool
@@ -38,6 +39,7 @@ var definitions = []objectiveDef{
 		// real encontrado al intentar validar Prueba 1 (estado inicial vacío
 		// debe producir un Action Intent).
 		IntentKey:  "initial_discovery",
+		PhaseKey:   "discovery",
 		EntityType: "host",
 		Matches:    func(attrs map[string]any) bool { return true },
 		Paths: []pathDef{
@@ -46,6 +48,7 @@ var definitions = []objectiveDef{
 	},
 	{
 		IntentKey:  "smb_enumeration",
+		PhaseKey:   "enumeration",
 		EntityType: "service",
 		Matches: func(attrs map[string]any) bool {
 			protocol, _ := attrs["protocol"].(string)
@@ -62,6 +65,7 @@ var definitions = []objectiveDef{
 		// tiene un comando fijo — el Candidate Generator produce un candidato
 		// por cada identidad conocida (ver strategy.GenerateSSHAuthCandidates).
 		IntentKey:  "ssh_auth_investigation",
+		PhaseKey:   "validation",
 		EntityType: "service",
 		Matches: func(attrs map[string]any) bool {
 			protocol, _ := attrs["protocol"].(string)
@@ -77,6 +81,7 @@ var definitions = []objectiveDef{
 		// roadmap). El objective se abre igual para que quede visible como
 		// "known unknown", tal como pide la sección 6/F del plan.
 		IntentKey:  "http_enumeration",
+		PhaseKey:   "enumeration",
 		EntityType: "service",
 		Matches: func(attrs map[string]any) bool {
 			protocol, _ := attrs["protocol"].(string)
@@ -95,12 +100,46 @@ var definitions = []objectiveDef{
 		// qué herramienta la descubrió (smbclient, ldapsearch, etc.) — esto es
 		// la correlación cross-tool que Slice 2 debía validar.
 		IntentKey:  "domain_identity_enumeration",
+		PhaseKey:   "enumeration",
 		EntityType: "domain",
 		Matches:    func(attrs map[string]any) bool { return true },
 		Paths: []pathDef{
 			{Key: "anonymous_bind", Description: "Intentar bind LDAP anónimo para enumerar identidades"},
 			{Key: "kerberos_user_enum", Description: "Enumerar usuarios válidos vía Kerberos pre-auth (sin credenciales)"},
 			{Key: "authenticated_query", Description: "Consultar el dominio con credenciales ya descubiertas"},
+		},
+	},
+	{
+		IntentKey:  "service_analysis",
+		PhaseKey:   "analysis",
+		EntityType: "service",
+		Matches:    func(attrs map[string]any) bool { return true },
+		Paths: []pathDef{
+			{Key: "technology_version", Description: "Precisar tecnología y versión observada"},
+			{Key: "weakness_classes", Description: "Evaluar clases de debilidad relevantes sin asumir vulnerabilidad"},
+			{Key: "relationships", Description: "Correlacionar servicio, identidades, endpoints y evidencia"},
+		},
+	},
+	{
+		IntentKey:  "post_access_investigation",
+		PhaseKey:   "post_access",
+		EntityType: "access_context",
+		Matches:    func(attrs map[string]any) bool { return true },
+		Paths: []pathDef{
+			{Key: "principal_context", Description: "Determinar principal, grupos y capacidades actuales"},
+			{Key: "host_context", Description: "Entender host, procesos, red y recursos alcanzables"},
+			{Key: "credential_context", Description: "Identificar credenciales y secretos expuestos"},
+		},
+	},
+	{
+		IntentKey:  "privilege_access_analysis",
+		PhaseKey:   "privilege_access",
+		EntityType: "privilege",
+		Matches:    func(attrs map[string]any) bool { return true },
+		Paths: []pathDef{
+			{Key: "effective_capability", Description: "Validar la capacidad o privilegio observado"},
+			{Key: "trust_boundary", Description: "Analizar qué frontera de acceso podría afectar"},
+			{Key: "validation_evidence", Description: "Definir evidencia necesaria antes de concluir impacto"},
 		},
 	},
 }
@@ -173,9 +212,9 @@ func EvaluateTriggers(s *store.Store, sessionID string, newEntityIDs []string) (
 
 			objID := uuid.NewString()
 			if _, err := tx.Exec(
-				`INSERT INTO methodology_objective(id, session_id, intent_key, trigger_entity_id, status, created_at)
-				 VALUES (?, ?, ?, ?, 'open', ?)`,
-				objID, sessionID, def.IntentKey, entID, now,
+				`INSERT INTO methodology_objective(id, session_id, intent_key, trigger_entity_id, status, created_at, phase_key)
+				 VALUES (?, ?, ?, ?, 'open', ?, ?)`,
+				objID, sessionID, def.IntentKey, entID, now, def.PhaseKey,
 			); err != nil {
 				return nil, fmt.Errorf("insert objective: %w", err)
 			}
