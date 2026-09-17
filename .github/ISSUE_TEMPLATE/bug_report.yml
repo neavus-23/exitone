@@ -1,0 +1,42 @@
+name: Bug report
+description: Something in ExitOne itself is broken (not "how do I use it").
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please **do not** include real target IPs, hostnames, credentials, or any other engagement-specific data — sanitize command output before pasting it.
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      description: Output of `git rev-parse HEAD` (or the release tag) you built from.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands run, with sanitized arguments (e.g. `10.0.0.1` instead of a real target).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exact error/output, sanitized.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / terminal
+      description: e.g. "Kali Linux, GNOME Terminal" or "macOS, iTerm2"
+    validations:
+      required: true
