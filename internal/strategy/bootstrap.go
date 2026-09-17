@@ -60,6 +60,9 @@ func GenerateInitialDiscoveryCandidates(s *store.Store, sessionID string) ([]str
 			UncertaintyReduction: 0.9, // no se sabe absolutamente nada del target todavía
 			RedundancyPenalty:    0,
 		}
+		if err := ApplyHistoricalOutcome(s, sessionID, "discover_exposed_services", &terms); err != nil {
+			return nil, err
+		}
 		score := terms.UtilityScore()
 		explanation := fmt.Sprintf(
 			"No existe información de servicios para %s (Investigation State vacío).\n"+
@@ -77,8 +80,10 @@ func GenerateInitialDiscoveryCandidates(s *store.Store, sessionID string) ([]str
 		if _, err := s.DB.Exec(`
 			INSERT INTO candidate(
 				id, session_id, source, objective_path_id, intent_key, parameters,
-				tool, command_template_rendered, score, score_terms, explanation, created_at, status
-			) VALUES (?, ?, 'methodology', ?, 'discover_exposed_services', ?, ?, ?, ?, ?, ?, ?, 'proposed')`,
+				tool, command_template_rendered, score, score_terms, explanation, created_at, status,
+				phase_key, expected_evidence
+			) VALUES (?, ?, 'methodology', ?, 'discover_exposed_services', ?, ?, ?, ?, ?, ?, ?, 'proposed',
+				'discovery', 'Puertos, servicios y versiones observables del target')`,
 			candID, sessionID, p.pathID, string(params),
 			rendered.Tool, rendered.FormatForShell(), score, string(termsJSON), explanation, now,
 		); err != nil {

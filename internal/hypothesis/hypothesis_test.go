@@ -128,7 +128,7 @@ func TestGenuineReopening(t *testing.T) {
 	if err := Support(s, hypID, obsA); err != nil {
 		t.Fatalf("Support: %v", err)
 	}
-	if err := Confirm(s, hypID); err != nil {
+	if err := Confirm(s, hypID, FindingDetails{}); err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
 	exp, _ := Explain(s, hypID[:8])

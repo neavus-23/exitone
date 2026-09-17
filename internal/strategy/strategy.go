@@ -31,6 +31,7 @@ type ScoreTerms struct {
 	HypothesisImpact     float64 `json:"hypothesis_impact"`
 	ObjectiveImpact      float64 `json:"objective_impact"`
 	UncertaintyReduction float64 `json:"uncertainty_reduction"`
+	HistoricalOutcome    float64 `json:"historical_outcome,omitempty"`
 	RedundancyPenalty    float64 `json:"redundancy_penalty"`
 }
 
@@ -41,7 +42,54 @@ func (t ScoreTerms) UtilityScore() float64 {
 		max(t.HypothesisImpact, 0.05) * // nunca 0 total: un candidato sin hipótesis afectadas
 		max(t.ObjectiveImpact, 0.05) * // aún puede tener algo de valor exploratorio
 		t.UncertaintyReduction
-	return base - t.RedundancyPenalty
+	historyFactor := 1.0
+	if t.HistoricalOutcome > 0 {
+		historyFactor = 0.75 + 0.5*t.HistoricalOutcome
+	}
+	return base*historyFactor - t.RedundancyPenalty
+}
+
+// ApplyHistoricalOutcome resume outcomes previos del mismo intent. El
+// historial solo ajusta el ranking: nunca convierte un resultado viejo en
+// hecho actual ni reutiliza parámetros/targets de otra sesión.
+func ApplyHistoricalOutcome(s *store.Store, sessionID, intentKey string, terms *ScoreTerms) error {
+	var attempts int
+	var average sql.NullFloat64
+	if err := s.DB.QueryRow(`SELECT COUNT(*), AVG(o.computed_information_gain)
+		FROM outcome o JOIN action a ON a.id=o.action_id JOIN candidate c ON c.id=a.candidate_id
+		WHERE c.intent_key=?`, intentKey).Scan(&attempts, &average); err != nil {
+		return err
+	}
+	if attempts == 0 || !average.Valid {
+		return nil
+	}
+	terms.HistoricalOutcome = clampScore(average.Float64)
+	var localZero int
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM outcome o JOIN action a ON a.id=o.action_id JOIN candidate c ON c.id=a.candidate_id
+		WHERE c.session_id=? AND c.intent_key=? AND o.computed_information_gain=0`, sessionID, intentKey).Scan(&localZero); err != nil {
+		return err
+	}
+	if localZero >= 2 {
+		terms.RedundancyPenalty += minFloat(0.4, float64(localZero)*0.1)
+	}
+	return nil
+}
+
+func clampScore(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func max(a, b float64) float64 {
@@ -129,6 +177,9 @@ func GenerateAndRankMethodologyCandidates(s *store.Store, sessionID string) ([]s
 			UncertaintyReduction: 0.8,
 			RedundancyPenalty:    0,
 		}
+		if err := ApplyHistoricalOutcome(s, sessionID, p.intentKey, &terms); err != nil {
+			return nil, err
+		}
 		score := terms.UtilityScore()
 
 		explanation := fmt.Sprintf(
@@ -147,8 +198,10 @@ func GenerateAndRankMethodologyCandidates(s *store.Store, sessionID string) ([]s
 		if _, err := s.DB.Exec(`
 			INSERT INTO candidate(
 				id, session_id, source, objective_path_id, intent_key, parameters,
-				tool, command_template_rendered, score, score_terms, explanation, created_at, status
-			) VALUES (?, ?, 'methodology', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed')`,
+				tool, command_template_rendered, score, score_terms, explanation, created_at, status,
+				phase_key, expected_evidence
+			) VALUES (?, ?, 'methodology', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed',
+				'enumeration', 'Shares, dominio o rechazo explícito de acceso anónimo')`,
 			candID, sessionID, p.pathID, p.intentKey, string(params),
 			rendered.Tool, rendered.FormatForShell(), score, string(termsJSON), explanation, now,
 		); err != nil {

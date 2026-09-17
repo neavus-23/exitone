@@ -33,8 +33,8 @@ func candidateExists(s *store.Store, sessionID, serviceEntityID, identityEntityI
 	err := s.DB.QueryRow(`
 		SELECT COUNT(*) FROM candidate
 		WHERE session_id = ? AND intent_key = 'test_ssh_auth'
-		AND parameters LIKE '%"service_entity_id":"` + serviceEntityID + `"%'
-		AND parameters LIKE '%"identity_entity_id":"` + identityEntityID + `"%'`,
+		AND parameters LIKE '%"service_entity_id":"`+serviceEntityID+`"%'
+		AND parameters LIKE '%"identity_entity_id":"`+identityEntityID+`"%'`,
 		sessionID,
 	).Scan(&count)
 	return count > 0, err
@@ -163,6 +163,9 @@ func insertSSHCandidate(s *store.Store, sessionID, source string, objectivePathI
 			identityValue, host,
 		)
 	}
+	if err := ApplyHistoricalOutcome(s, sessionID, "test_ssh_auth", &terms); err != nil {
+		return "", err
+	}
 	score := terms.UtilityScore()
 	termsJSON, _ := json.Marshal(terms)
 	params, _ := json.Marshal(map[string]any{
@@ -177,8 +180,10 @@ func insertSSHCandidate(s *store.Store, sessionID, source string, objectivePathI
 	_, err := s.DB.Exec(`
 		INSERT INTO candidate(
 			id, session_id, source, objective_path_id, intent_key, parameters,
-			tool, command_template_rendered, score, score_terms, explanation, created_at, status, hypothesis_id
-		) VALUES (?, ?, ?, ?, 'test_ssh_auth', ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)`,
+			tool, command_template_rendered, score, score_terms, explanation, created_at, status, hypothesis_id,
+			phase_key, risk_level, expected_evidence
+		) VALUES (?, ?, ?, ?, 'test_ssh_auth', ?, ?, ?, ?, ?, ?, ?, 'proposed', ?,
+			'validation', 'medium', 'Éxito o rechazo explícito de autenticación SSH')`,
 		candID, sessionID, source, nullableStr(objectivePathID), string(params),
 		rendered.Tool, rendered.FormatForShell(), score, string(termsJSON), explanation, now, nullableStr(hypothesisID),
 	)

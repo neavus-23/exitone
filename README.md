@@ -19,7 +19,9 @@
 
 ExitOne is a terminal-native investigation engine for pentesting, labs, and CTF-style security research. Instead of treating every command as an isolated interaction, it builds a persistent model of what is known, what remains unknown, what has already been tested, and what new evidence changes earlier conclusions.
 
-The core design is **deterministic before generative**: structured outputs are parsed and correlated in Go first; a local LLM is used only where it adds value, such as low-confidence fallback extraction and natural-language queries over already-structured investigation state.
+The core design is **deterministic before generative**: structured outputs are parsed and correlated in Go first; a local LLM is used only where it adds value, such as low-confidence fallback extraction, asynchronous exploratory strategy, and natural-language queries over already-structured investigation state.
+
+The full pipeline is `Telemetry → Evidence → Observations → Structured Knowledge → Investigation State → Methodology → Strategy → Candidate Actions → Human`. Exploitation guidance, post-access, and privilege/access analysis are valid parts of the investigation; autonomous execution is not.
 
 ---
 
@@ -35,7 +37,7 @@ ExitOne sits between those two approaches:
 - **Evidence reopening** — a previously closed hypothesis can be reopened when newly discovered structured evidence invalidates the assumptions under which it was tested.
 - **Provenance-aware ingestion** — deterministic observations and LLM-assisted observations are kept visibly separate.
 - **Hybrid GraphRAG** — `exitone ask` uses narrow LLM classification plus deterministic SQL graph traversal before natural-language generation.
-- **Human control** — autocomplete inserts a suggestion into the shell buffer; pressing Enter remains the operator's decision.
+- **Human control** — candidates may be a direction, technique, or command. ExitOne never runs their stored command; pressing Enter remains the operator's decision.
 
 ---
 
@@ -145,9 +147,9 @@ Running `exitone` with no arguments opens an interactive REPL inspired by `msfco
 exitone(target) > next
 ```
 
-### Read-only dashboard
+### Read-only dashboard and observable tmux layout
 
-`exitone watch` continuously renders stages, top candidates, and open objectives. `exitone start <target> --tmux` uses the legacy two-pane tmux layout with the operator shell on one side and `exitone watch` on the other.
+`exitone watch` continuously renders stages, top candidates, and open objectives. `exitone start <target> --tmux` creates four panes: `OPERATOR`, `EXITONE LIVE`, `EVIDENCE & EVENTS`, and `VALIDATION CONTROL`. Add `--session-name <name> --detach` to prepare a persistent session without immediately attaching; reconnect with `tmux attach -t <name>`.
 
 ---
 
@@ -221,6 +223,7 @@ source "$HOME/.zshrc"
 
 | Mode | Behavior |
 | --- | --- |
+| Every completed command | A fingerprinted event is stored, including failures and commands without useful output; exact unique matches are linked automatically and ambiguous matches stay explicitly ambiguous |
 | Command writes an output file (`-o`, `-oG`, `-oX`, `--output`, `>`, etc.) | The file is automatically passed to `exitone ingest` after a successful command |
 | Zsh is running inside **tmux** and no output file exists | `tmux pipe-pane` captures the command output and submits the relevant slice in the background |
 | Embedded TUI without tmux and no output file exists | There is currently **no `pipe-pane` stream capture**; redirect/save the output or ingest it manually |
@@ -304,15 +307,21 @@ exitone ask "¿qué relación tiene esta entidad con el host?"
 
 | Command | Purpose |
 | --- | --- |
-| `exitone start <target> [--tmux]` | Start/resume a target and launch the TUI; optionally use the tmux layout |
+| `exitone start <target> [--tmux] [--session-name <name>] [--detach]` | Start/resume a target and launch the TUI or the persistent four-pane tmux layout |
 | `exitone session new <target> [--fresh]` | Create or activate an investigation session |
 | `exitone ingest <file> [--tool <hint>] [--host <ip>] [--for-action <id>]` | Ingest tool output |
 | `exitone ingest identities <file> --source <source>` | Add one identity per line with provenance |
+| `exitone events [--tail N]` | Inspect captured command events and their automatic association state |
 | `exitone next [--raw]` | Show ranked proposed actions; `--raw` returns only the top command |
 | `exitone why <candidate-id>` | Explain the candidate and its score terms |
 | `exitone accept <candidate-id>` | Register an action and decision snapshot without executing it |
 | `exitone resolve <action-id> --result fail\|success` | Record the result of a modeled hypothesis test |
 | `exitone dismiss <candidate-id>` | Dismiss a stale or unwanted candidate |
+| `exitone observation <list\|confirm\|reject>` | Review low-trust LLM observations; confirmation is always explicit |
+| `exitone hypothesis <list\|open\|support\|contradict\|confirm\|refute>` | Manage hypotheses and their evidence links |
+| `exitone objective <list\|add\|complete\|abandon>` | Manage operator objectives independently of methodology gaps |
+| `exitone credential add\|list\|attempt` | Store and track credentials; values are masked unless `list --reveal` is used |
+| `exitone scope add\|list\|remove` | Record explicit in/out-of-scope rules; violations are warned prominently but not technically blocked |
 | `exitone status` | Show entities and methodology objectives |
 | `exitone stages` | Show evidence-derived investigation stages |
 | `exitone ask "<question>"` | Query structured investigation state through Hybrid GraphRAG |
@@ -483,16 +492,7 @@ No LLM text interpretation is used for this comparison.
 NOT_STARTED · ACTIVE · PARTIAL · SUFFICIENT · BLOCKED · REOPENED
 ```
 
-Current stage model:
-
-- `surface_discovery`
-- `service_fingerprinting`
-- `http_mapping`
-- `identity_discovery`
-- `authentication`
-- `initial_access`
-
-`initial_access` is intentionally reported as `NOT_STARTED` because exploitation/access acquisition is **not yet modeled** in the current methodology engine.
+Current phase model is deliberately non-blocking: `discovery`, `enumeration`, `analysis`, `hypotheses`, `validation`, `exploitation_guidance`, `post_access`, `privilege_access`, and `objectives`. A later phase can become active while earlier questions remain open.
 
 ---
 
@@ -525,6 +525,7 @@ ExitOne expects an OpenAI-compatible `/chat/completions` API. Defaults:
 | --- | --- | --- |
 | `EXITONE_LLM_URL` | `http://127.0.0.1:8090/v1` | Local OpenAI-compatible API base URL |
 | `EXITONE_LLM_MODEL` | `qwen2.5-3b` | Model identifier sent to the endpoint |
+| `EXITONE_ALLOW_REMOTE_LLM` | unset | Explicit opt-in required before using a non-loopback endpoint |
 | `EXITONE_DEBUG_LOG` | `~/.exitone/ultra_debug.log` | Override structured debug log path |
 | `EXITONE_EVENTS_LOG` | `~/.exitone/events.jsonl` | Zsh hook event log path |
 
@@ -536,7 +537,9 @@ export EXITONE_LLM_MODEL="qwen2.5-3b"
 ```
 
 > [!CAUTION]
-> `ultra_debug.log` is intentionally verbose and can contain commands, candidate explanations, errors, and LLM request/response context. Treat `~/.exitone/` as sensitive investigation data.
+> The database, evidence, transcripts, and logs are sensitive engagement material. Debug logs redact common secret forms and do not contain raw LLM prompts/responses. Credential values are intentionally stored as local SQLite plaintext and only masked at presentation time; protect the directory accordingly. Remote LLM endpoints never receive raw credential values or raw unstructured evidence.
+
+After each ingestion ExitOne increments the session revision, generates deterministic candidates immediately, and coalesces one background exploratory-strategy job per session. Model failure never makes ingestion fail, and results computed for an obsolete revision are discarded.
 
 ---
 
@@ -579,6 +582,10 @@ The current tests cover, among other things:
 - idempotent re-ingestion,
 - host creation cascading from discovered services,
 - attribute merge behavior.
+- schema migration from legacy action rows,
+- event fingerprint idempotence and unique/ambiguous matching,
+- credential masking,
+- validated exploratory LLM proposals and stale-revision behavior.
 
 A manual TUI validation guide is available in [`docs/testing-guide.md`](docs/testing-guide.md).
 
@@ -588,12 +595,12 @@ A manual TUI validation guide is available in [`docs/testing-guide.md`](docs/tes
 
 ExitOne is an active research prototype. The following boundaries are intentional or currently unresolved:
 
-1. **No autonomous exploitation.** The current stage model does not implement initial access/exploitation methodology.
-2. **Deterministic command coverage is still narrow.** Several methodology paths can be opened before a corresponding command template exists.
-3. **LLM fallback is low-trust by design.** Level 2 observations are capped at `0.5` confidence and do not automatically drive methodology.
+1. **No autonomous execution.** ExitOne may reason across exploitation and post-access, but no component executes a candidate command.
+2. **Deterministic command coverage is still narrow.** Several methodology paths can be opened before a corresponding command template exists; conceptual candidates keep those gaps visible.
+3. **LLM output is low-trust by design.** Observations stay pending until human confirmation and exploratory candidate confidence is capped at `0.5`.
 4. **Full passive stdout capture currently requires tmux.** The Zsh hook uses `tmux pipe-pane`; the default embedded TUI does not yet stream arbitrary PTY output into ingestion when no output file exists.
-5. **Pending-action auto-linking can be ambiguous.** If multiple unresolved actions use the same tool, automatic outcome matching selects the most recent one. Use `--for-action` to disambiguate.
-6. **Identity ingestion is currently a normalized list path.** Raw outputs from every identity-enumeration tool do not yet have dedicated deterministic parsers.
+5. **Ambiguity is preserved.** Multiple exact candidate matches are recorded as ambiguous and require `accept`, `resolve`, or `--for-action`; ExitOne does not choose one arbitrarily.
+6. **Credential encryption at rest is not implemented.** Values are local SQLite plaintext by explicit design and therefore require filesystem protection.
 7. **Shell hooks are Zsh-oriented.** Other shells can still use the CLI/TUI and manual ingestion, but do not get the provided hook workflow.
 
 These constraints are preferable to silently pretending unsupported behavior is reliable.

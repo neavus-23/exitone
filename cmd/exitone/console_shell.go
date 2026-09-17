@@ -19,8 +19,8 @@ import (
 // construidos una vez en runConsole() desde el único slice de
 // console_commands.go (nunca pueden desincronizarse entre sí).
 var (
-	consoleRegistry  *console.Registry
-	consoleHandlers  map[string]consoleHandler
+	consoleRegistry *console.Registry
+	consoleHandlers map[string]consoleHandler
 )
 
 // runConsole reemplaza el viejo runRepl() self-exec-por-línea (sección M,
@@ -142,7 +142,8 @@ func historyFilePath() string {
 		return ".exitone_history"
 	}
 	dir := filepath.Join(home, ".exitone")
-	os.MkdirAll(dir, 0o755)
+	os.MkdirAll(dir, 0o700)
+	_ = os.Chmod(dir, 0o700)
 	return filepath.Join(dir, "history")
 }
 

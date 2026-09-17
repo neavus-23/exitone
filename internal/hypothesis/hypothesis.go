@@ -125,21 +125,45 @@ func recomputeStatus(s *store.Store, hypothesisID, newRelation string) error {
 	return err
 }
 
+// FindingDetails son los campos explícitos de un hallazgo, fijados por el
+// operador al cerrar una hipótesis — nunca inferidos por conteo ni
+// redactados libremente por el LLM (`exitone report` los usa tal cual).
+// Todos son opcionales: una hipótesis cerrada sin detalle sigue siendo
+// válida, solo que el reporte final la mostrará sin severidad/remediación.
+type FindingDetails struct {
+	Severity      string // '' | low | medium | high | critical
+	Remediation   string
+	EvidenceNote  string // prueba de impacto puntual, ej. un flag o un output concreto
+}
+
 // Confirm es un cierre EXPLÍCITO (nunca automático por conteo) — el llamador
 // decide que la evidencia acumulada es concluyente. Solo esto (o Refute)
 // deja una hipótesis en un estado del que una contradicción futura la
 // reabre genuinamente.
-func Confirm(s *store.Store, hypothesisID string) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.DB.Exec(`UPDATE hypothesis SET status = ?, closed_at = ? WHERE id = ?`, string(Confirmed), now, hypothesisID)
-	return err
+func Confirm(s *store.Store, hypothesisID string, details FindingDetails) error {
+	return closeWithDetails(s, hypothesisID, Confirmed, details)
 }
 
 // Refute es el cierre explícito equivalente a Confirm, para cuando la
 // evidencia concluyente va en contra de la proposición.
-func Refute(s *store.Store, hypothesisID string) error {
+func Refute(s *store.Store, hypothesisID string, details FindingDetails) error {
+	return closeWithDetails(s, hypothesisID, Refuted, details)
+}
+
+func closeWithDetails(s *store.Store, hypothesisID string, status Status, details FindingDetails) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.DB.Exec(`UPDATE hypothesis SET status = ?, closed_at = ? WHERE id = ?`, string(Refuted), now, hypothesisID)
+	_, err := s.DB.Exec(
+		`UPDATE hypothesis SET status = ?, closed_at = ?,
+		 severity = CASE WHEN ? != '' THEN ? ELSE severity END,
+		 remediation = CASE WHEN ? != '' THEN ? ELSE remediation END,
+		 evidence_note = CASE WHEN ? != '' THEN ? ELSE evidence_note END
+		 WHERE id = ?`,
+		string(status), now,
+		details.Severity, details.Severity,
+		details.Remediation, details.Remediation,
+		details.EvidenceNote, details.EvidenceNote,
+		hypothesisID,
+	)
 	return err
 }
 

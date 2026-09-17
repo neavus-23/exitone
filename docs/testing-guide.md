@@ -1,76 +1,103 @@
-# Guía de prueba manual — ExitOne (estado actual, post-TUI)
+# Guía de validación observable de ExitOne
 
-## 0. Lo más importante: cómo arrancar
+Esta guía valida el producto como compañero cognitivo local durante todo el ciclo de una investigación autorizada. ExitOne observa, recuerda, correlaciona y recomienda; el operador humano ejecuta cada acción.
 
-```bash
-exitone start 192.168.72.130
-```
-
-Esto te deja **directo dentro de la app**: una sola ventana con terminal real embebida a la izquierda (tu shell de siempre) y un panel de correlación en vivo a la derecha. No hace falta tmux, no hace falta abrir nada más.
-
-Si prefieres el layout viejo de dos paneles de tmux (por si algo raro pasa con la terminal embebida): `exitone start 192.168.72.130 --tmux`.
-
-## 1. Trabaja normal en el panel izquierdo
-
-Corre lo que correrías siempre — `nmap`, `smbclient`, `hydra`, `curl`, lo que sea. **No necesitas decirle a ExitOne qué herramienta es.** Si el comando manda su output a un archivo (`-o`, `-oG`, `--output`, o `>`), se auto-ingiere solo; si no, igual se captura completo vía el stream del pane y se procesa en segundo plano (verás un aviso `[exitone] capturando output completo de '<herramienta>'...`).
-
-**Ya es seguro correr `exitone <lo que sea>` desde dentro de esta misma terminal** (`status`, `accept`, `resolve`, `ingest`, `ask`) — el freeze que había antes está corregido.
-
-## 2. El panel derecho (dashboard en vivo)
-
-Se actualiza solo cada ~2s. Tiene 3 vistas, cambia entre ellas con **F2**:
-
-- **OVERVIEW** (default): etapas de la investigación + top-4 sugerencias + objectives abiertos.
-- **GRAPH**: árbol del attack surface (host → servicios/shares/dominio).
-- **VAULT**: identidades descubiertas, con su procedencia (`confirmed` / `via:fuente` / `llm(confianza)`).
-
-Otros atajos://
-- **Ctrl+Space** — inserta la sugerencia de mayor score en tu prompt (nunca la ejecuta, sigue siendo tuyo pulsar Enter).
-- **Ctrl+P** — pausa/reanuda el refresco del panel (para leer tranquilo algo que está por cambiar).
-- **F1** — ayuda con todos los atajos; cualquier tecla la cierra.
-- **Ctrl+Q** — salir de ExitOne (el shell embebido se cierra con él).
-
-## 3. El loop básico de comandos (todos corren dentro de la terminal embebida)
+## 1. Verificación previa
 
 ```bash
-exitone next              # sugerencias rankeadas
-exitone why <id>          # por qué (prefijo del id)
-exitone accept <id>       # registra la acción — NO ejecuta nada
-exitone resolve <action-id> --result fail|success   # tras probar algo (ej. SSH)
-exitone dismiss <id>      # descartar una sugerencia obsoleta
+go test ./...
+go vet ./...
+go build -o exitone ./cmd/exitone
 ```
 
-## 4. Identidades → metodología SSH
+Use un workspace desechable y protéjalo como material sensible:
 
 ```bash
-echo "usuario" > /tmp/ident.txt
-exitone ingest identities /tmp/ident.txt --source <de-dónde-salió>
+umask 077
+mkdir -p ~/.exitone/runs/<engagement>
 ```
 
-Si después aparece OTRA identidad nueva, deberías ver `⚠ Hipótesis reabiertas por evidencia estructural nueva` — es el comportamiento más importante a validar (reapertura sin interpretar texto, solo comparación de conjuntos).
+Compruebe además Go 1.27+, Zsh, tmux, SQLite y las herramientas autorizadas para el engagement.
 
-## 5. Preguntas en lenguaje natural
+## 2. Sesión visible y persistente
 
 ```bash
-exitone ask "¿qué falta por investigar?"
-exitone ask "¿debería reintentar SSH? ¿con qué identidad y por qué?"
-exitone ask "¿qué herramienta dio mejores resultados?"
+exitone start <target> --tmux --session-name exitone-validation --detach
+tmux attach -t exitone-validation
 ```
 
-Prueba preguntas que crucen varias piezas de información — es donde vale la pena estresarlo. Si responde "no tengo esa información" cuando SÍ debería saberlo, o si inventa algo que no está en el estado real, es un hallazgo real, avísame.
+El layout contiene:
 
-## 6. Herramienta sin parser propio
+```text
+OPERATOR | EXITONE LIVE
+         | EVIDENCE & EVENTS
+         | VALIDATION CONTROL
+```
 
-Si algo cae al LLM (verás `Formato no reconocido... usando extracción Nivel 2`), la calidad de extracción puede ser floja — es esperado con un modelo de 3B, es justo lo que quiero que midas. Las entidades que salgan de ahí quedan marcadas `INFERRED-LLM`, nunca como hecho confirmado.
+Todo comando contra el target se escribe exclusivamente en `OPERATOR`. Para observar sin tomar control:
 
-## Qué reportarme
+```bash
+tmux attach -r -t exitone-validation
+```
 
-No hace falta que expliques en detalle — solo dime cuándo llevas un rato probando, o antes si ves:
+Desconectarse de tmux no detiene la prueba. Antes de cada acción muestre fase, objetivo, acción, razón, evidencia esperada y si modifica el target. Después muestre exit code, evidencia, relaciones, hipótesis afectadas, outcome y siguiente recomendación.
 
-- una sugerencia sin sentido dado lo que ya se sabe,
-- el mismo comando repetido para algo ya resuelto,
-- un `why`/`ask` que no cuadra con los datos reales,
-- el dashboard sin actualizarse, o la terminal embebida rara (esto lo tratamos con prioridad — es la pieza más nueva y compleja),
-- cualquier `error:` o crash.
+## 3. Loop que debe validarse
 
-Todo queda en `~/.exitone/ultra_debug.log` (cada comando, cada score, todo el tráfico con el LLM) — lo reviso directo ahí.
+```text
+candidate → decisión humana → Enter → event → evidence → outcome → strategy revision
+```
+
+1. Revise `exitone next` y `exitone why <candidate>`.
+2. Escriba y ejecute la acción desde `OPERATOR`; no invoque el comando desde ExitOne.
+3. Confirme que `exitone events` conserva también errores y ejecuciones sin output.
+4. Una coincidencia única debe enlazarse; varias coincidencias deben quedar `ambiguous`; ninguna coincidencia debe quedar como trabajo realizado sin inventar acción.
+5. Use `accept`, `resolve` y `ingest --for-action` solo como fallback o para una decisión explícita.
+6. Confirme que la revisión sube, los candidatos deterministas aparecen de inmediato y el job LLM corre en background sin bloquear la ingesta.
+
+## 4. Fases y conocimiento
+
+Valide que las fases son no bloqueantes: `discovery`, `enumeration`, `analysis`, `hypotheses`, `validation`, `exploitation_guidance`, `post_access`, `privilege_access` y `objectives`.
+
+- La evidencia cruda no debe aparecer como hecho por sí sola.
+- Una observación LLM queda pendiente y con confianza limitada hasta `observation confirm`.
+- Las hipótesis conservan evidencia de soporte y contradicción.
+- Los candidatos muestran tipo, fase, fuente, confianza, riesgo, asunciones y evidencia esperada.
+- Un resultado fallido reduce repetición; nueva evidencia puede justificar reapertura.
+- `ask`, `why` y `guide` deben basarse en el grafo persistido, no en un playbook del target.
+
+## 5. Credenciales y privacidad
+
+```bash
+exitone credential add --identity <ref> --service <ref> --source <evidence> --value '<secret>'
+exitone credential list
+exitone credential list --reveal
+exitone credential attempt <id> --service <ref> --result fail
+```
+
+El primer listado debe estar enmascarado. `--reveal` es deliberado. El valor se almacena en texto plano dentro de la base local; aplique permisos `0700` al directorio y `0600` a bases, logs y transcripciones. Verifique que secretos no aparezcan en debug logs, explicaciones ni prompts de estrategia. Un endpoint LLM no-loopback requiere `EXITONE_ALLOW_REMOTE_LLM=1` y nunca recibe evidencia cruda ni valores de credenciales.
+
+## 6. Checkpoints modificadores
+
+Solo lectura puede continuar una vez visible. Antes de login autenticado, requests modificadores, uploads, listeners/payloads, creación de repositorio, creación de objetos, push o escritura derivada, deje un checkpoint visible en `VALIDATION CONTROL`. Registre después el outcome y cualquier cambio de principal.
+
+## 7. VPN de laboratorio
+
+Antes de iniciarla, inspeccione interfaces `tun`, procesos OpenVPN y rutas. Reutilice una VPN válida si el target ya está correctamente enrutado. Si debe iniciar una:
+
+1. Arranque un único perfil en un panel visible, con PID y log conocidos.
+2. Verifique `Initialization Sequence Completed`, interfaz tun e `ip route get <target>`.
+3. Haga una comprobación limitada de conectividad.
+4. Si falla, detenga solo ese PID y retire únicamente sus rutas antes de probar el perfil alternativo.
+5. Nunca mantenga dos perfiles activos ni cambie permanentemente NetworkManager, DNS o rutas.
+
+## 8. Aceptación y cierre
+
+```bash
+go test ./...
+go vet ./...
+```
+
+La prueba pasa si ExitOne acompaña todas las fases, evita repetición injustificada, correlaciona identidades/credenciales/aplicaciones/principales, separa evidencia de inferencia, conserva provenance y cronología, y ningún componente ejecuta candidatos.
+
+Guarde un resumen con revisiones, eventos, intentos, ramas, hipótesis y outcomes. Después detenga solo la VPN creada por la prueba, retire credenciales y claves temporales, elimine la copia temporal del código y conserve únicamente los artefactos acordados.

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"exitone/internal/console"
 )
@@ -38,7 +39,10 @@ func handleHelp(cs *ConsoleSession, args []string) error {
 	}
 	sort.Strings(names)
 	for _, cat := range names {
-		fmt.Printf("\n%s\n", cat)
+		// Encabezado de sección en MAYÚSCULA — mismo formato de industria
+		// que `nmap` usa en su OPTIONS SUMMARY (TARGET SPECIFICATION, HOST
+		// DISCOVERY, etc.), agrupando por tarea en vez de alfabético.
+		fmt.Printf("\n%s\n", strings.ToUpper(cat))
 		for _, spec := range categories[cat] {
 			printSpecLine(spec)
 		}

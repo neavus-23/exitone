@@ -38,14 +38,14 @@ type Entity struct {
 }
 
 type Relationship struct {
-	ID                       string
-	SourceEntityID           string
-	TargetEntityID           string
-	Kind                     string
-	Confidence               float64
-	SupportingObservationID  *string
-	ValidFrom                time.Time
-	ValidTo                  *time.Time
+	ID                      string
+	SourceEntityID          string
+	TargetEntityID          string
+	Kind                    string
+	Confidence              float64
+	SupportingObservationID *string
+	ValidFrom               time.Time
+	ValidTo                 *time.Time
 }
 
 type MethodologyObjective struct {
@@ -55,48 +55,58 @@ type MethodologyObjective struct {
 	TriggerEntityID string
 	Status          string
 	CreatedAt       time.Time
+	PhaseKey        string
 }
 
 type ObjectivePath struct {
-	ID           string
-	ObjectiveID  string
-	PathKey      string
-	Description  string
-	Status       string
-	CreatedAt    time.Time
+	ID          string
+	ObjectiveID string
+	PathKey     string
+	Description string
+	Status      string
+	CreatedAt   time.Time
 }
 
 type Candidate struct {
-	ID                       string
-	SessionID                string
-	Source                   string
-	ObjectivePathID          *string
-	IntentKey                string
-	Parameters               map[string]any
-	Tool                     string
-	CommandTemplateRendered  string
-	Score                    float64
-	ScoreTerms               map[string]float64
-	Explanation              string
-	CreatedAt                time.Time
-	Status                   string
+	ID                      string
+	SessionID               string
+	Source                  string
+	ObjectivePathID         *string
+	IntentKey               string
+	Parameters              map[string]any
+	Tool                    string
+	CommandTemplateRendered string
+	Score                   float64
+	ScoreTerms              map[string]float64
+	Explanation             string
+	CreatedAt               time.Time
+	Status                  string
+	Kind                    string
+	PhaseKey                string
+	Confidence              float64
+	RiskLevel               string
+	ExpectedEvidence        string
+	Assumptions             []string
+	StateRevision           int64
 }
 
 type Action struct {
 	ID              string
 	CandidateID     string
 	ObjectivePathID *string
-	ExecutedAt      time.Time
+	DecidedAt       *time.Time
+	ExecutedAt      *time.Time
+	Status          string
 }
 
 type Outcome struct {
-	ID                       string
-	ActionID                 string
-	NewEntities              int
-	NewRelationships         int
-	HypothesesConfirmed      int
-	HypothesesRefuted        int
-	ContradictionsResolved   int
-	ComputedInformationGain  float64
-	RecordedAt               time.Time
+	ID                      string
+	ActionID                string
+	NewEntities             int
+	NewRelationships        int
+	HypothesesConfirmed     int
+	HypothesesRefuted       int
+	ContradictionsResolved  int
+	ComputedInformationGain float64
+	RecordedAt              time.Time
 }

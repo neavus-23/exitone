@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"exitone/internal/debuglog"
@@ -40,7 +42,7 @@ func New() *Client {
 	return &Client{
 		baseURL: url,
 		model:   model,
-		http:    &http.Client{Timeout: 60 * time.Second},
+		http:    &http.Client{Timeout: 180 * time.Second},
 	}
 }
 
@@ -66,6 +68,16 @@ type chatResponse struct {
 // crudo. No hace streaming — las llamadas de ExitOne son cortas (extracción,
 // explicación puntual), no un chat interactivo largo.
 func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	return c.ChatWithMaxTokens(ctx, systemPrompt, userPrompt, 700)
+}
+
+// ChatWithMaxTokens es Chat con un límite de tokens explícito — para
+// respuestas largas por naturaleza (ej. redactar el reporte final completo)
+// donde el límite corto por defecto cortaría la respuesta a la mitad.
+func (c *Client) ChatWithMaxTokens(ctx context.Context, systemPrompt, userPrompt string, maxTokens int) (string, error) {
+	if err := c.validateLocality(); err != nil {
+		return "", err
+	}
 	// El LLM es parte de ExitOne, no un complemento que el operador arranca
 	// aparte: cada llamada garantiza primero que el sidecar esté vivo,
 	// arrancándolo si hace falta (ver server.go). El costo en el camino
@@ -81,7 +93,7 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (str
 			{Role: "user", Content: userPrompt},
 		},
 		Temperature: 0.1, // extracción/explicación determinista, no creatividad
-		MaxTokens:   700,
+		MaxTokens:   maxTokens,
 	}
 	buf, err := json.Marshal(reqBody)
 	if err != nil {
@@ -98,7 +110,7 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (str
 	resp, err := c.http.Do(req)
 	elapsed := time.Since(start).Seconds()
 	if err != nil {
-		debuglog.LogError("llm_chat", err, map[string]any{"system_prompt": systemPrompt, "user_prompt": userPrompt, "elapsed_s": elapsed})
+		debuglog.LogError("llm_chat", err, map[string]any{"system_prompt_len": len(systemPrompt), "user_prompt_len": len(userPrompt), "elapsed_s": elapsed})
 		return "", fmt.Errorf("llm request failed (¿está corriendo llama-server en %s?): %w", c.baseURL, err)
 	}
 	defer resp.Body.Close()
@@ -109,25 +121,51 @@ func (c *Client) Chat(ctx context.Context, systemPrompt, userPrompt string) (str
 	}
 	if resp.StatusCode != http.StatusOK {
 		debuglog.Log("llm_chat", map[string]any{
-			"system_prompt": systemPrompt, "user_prompt": userPrompt, "elapsed_s": elapsed,
-			"status_code": resp.StatusCode, "raw_response": string(body),
+			"system_prompt_len": len(systemPrompt), "user_prompt_len": len(userPrompt), "elapsed_s": elapsed,
+			"status_code": resp.StatusCode, "response_len": len(body),
 		})
 		return "", fmt.Errorf("llm respondió %d: %s", resp.StatusCode, string(body))
 	}
 
 	var cr chatResponse
 	if err := json.Unmarshal(body, &cr); err != nil {
-		debuglog.LogError("llm_chat_parse", err, map[string]any{"raw_response": string(body)})
+		debuglog.LogError("llm_chat_parse", err, map[string]any{"response_len": len(body)})
 		return "", fmt.Errorf("parsear respuesta del llm: %w", err)
 	}
 	if len(cr.Choices) == 0 {
-		debuglog.Log("llm_chat", map[string]any{"warning": "no choices", "raw_response": string(body)})
+		debuglog.Log("llm_chat", map[string]any{"warning": "no choices", "response_len": len(body)})
 		return "", fmt.Errorf("el llm no devolvió ninguna respuesta")
 	}
 
 	debuglog.Log("llm_chat", map[string]any{
-		"system_prompt": systemPrompt, "user_prompt": userPrompt, "elapsed_s": elapsed,
-		"raw_response_content": cr.Choices[0].Message.Content,
+		"system_prompt_len": len(systemPrompt), "user_prompt_len": len(userPrompt), "elapsed_s": elapsed,
+		"response_len": len(cr.Choices[0].Message.Content),
 	})
 	return cr.Choices[0].Message.Content, nil
+}
+
+// validateLocality evita que contexto de investigación salga de la máquina
+// por un simple cambio accidental de URL. Un endpoint remoto requiere el
+// opt-in explícito EXITONE_ALLOW_REMOTE_LLM=1; aun así, los constructores de
+// contexto nunca incluyen credential.secret_value.
+func (c *Client) validateLocality() error {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return fmt.Errorf("EXITONE_LLM_URL inválida: %w", err)
+	}
+	host := strings.ToLower(u.Hostname())
+	local := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if !local && os.Getenv("EXITONE_ALLOW_REMOTE_LLM") != "1" {
+		return fmt.Errorf("endpoint LLM remoto %q bloqueado; define EXITONE_ALLOW_REMOTE_LLM=1 para autorizar explícitamente la salida de contexto", host)
+	}
+	return nil
+}
+
+func (c *Client) IsRemote() bool {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return true
+	}
+	host := strings.ToLower(u.Hostname())
+	return host != "localhost" && host != "127.0.0.1" && host != "::1"
 }

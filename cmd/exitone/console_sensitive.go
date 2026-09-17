@@ -15,6 +15,7 @@ var sensitiveFlagNames = map[string]bool{
 	"--token":    true,
 	"--secret":   true,
 	"--api-key":  true,
+	"--value":    true,
 }
 
 // isSensitiveLine decide si una línea NO debería persistirse en el
@@ -72,7 +73,7 @@ func (f *filteredHistory) Write(line string) (int, error) {
 
 func (f *filteredHistory) GetLine(pos int) (string, error) { return f.inner.GetLine(pos) }
 func (f *filteredHistory) Len() int                        { return f.inner.Len() }
-func (f *filteredHistory) Dump() interface{}                { return f.inner.Dump() }
+func (f *filteredHistory) Dump() interface{}               { return f.inner.Dump() }
 
 func firstTokenAndRest(line string) (string, []string) {
 	tokens := tokenizeConsoleLine(line)

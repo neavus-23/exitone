@@ -28,7 +28,7 @@ func printCandidatesForViewContext(cs *ConsoleSession, ctx console.ConsoleContex
 	}
 
 	rows, err := cs.Store.DB.Query(`
-		SELECT id, score, command_template_rendered, status FROM candidate
+		SELECT id, score, command_template_rendered, explanation, kind, phase_key, risk_level, status FROM candidate
 		WHERE session_id = ? AND status = 'proposed' ORDER BY score DESC`, cs.SessionID)
 	if err != nil {
 		return err
@@ -39,13 +39,17 @@ func printCandidatesForViewContext(cs *ConsoleSession, ctx console.ConsoleContex
 	var results console.ResultSet
 	i := 0
 	for rows.Next() {
-		var id, command, status string
+		var id, command, explanation, kind, phase, risk, status string
 		var score float64
-		if err := rows.Scan(&id, &score, &command, &status); err != nil {
+		if err := rows.Scan(&id, &score, &command, &explanation, &kind, &phase, &risk, &status); err != nil {
 			return err
 		}
+		display := command
+		if display == "" {
+			display = explanation
+		}
 		hostAddr := candidateTargetHost(cs.Store, id)
-		row := []string{fmt.Sprintf("%d", i), id[:8], fmt.Sprintf("%.2f", score), truncateText(command, 50), status, scopeLabel(cs, hostAddr)}
+		row := []string{fmt.Sprintf("%d", i), id[:8], fmt.Sprintf("%.2f", score), kind, phase, risk, truncateText(display, 45), status, scopeLabel(cs, hostAddr)}
 		results = append(results, console.ResultRef{Type: console.Candidate, ID: id, Label: id[:8]})
 		if related[id] {
 			relatedRows = append(relatedRows, row)
@@ -55,7 +59,7 @@ func printCandidatesForViewContext(cs *ConsoleSession, ctx console.ConsoleContex
 		i++
 	}
 
-	headers := []string{"#", "ID", "Score", "Command", "Status", "Scope"}
+	headers := []string{"#", "ID", "Score", "Kind", "Phase", "Risk", "Suggestion", "Status", "Scope"}
 	fmt.Print(console.RenderTable("Related to "+describeContext(ctx), headers, relatedRows))
 	fmt.Println()
 	fmt.Print(console.RenderTable("Other suggestions", headers, otherRows))

@@ -1,0 +1,424 @@
+.TH EXITONE 1 "Septiembre 2026" "ExitOne" "Manual del Usuario"
+.
+.SH NOMBRE
+exitone \- copiloto de investigaci\('on para pentesting y bug bounty: observa, correlaciona y sugiere \(em nunca ejecuta nada por su cuenta
+.
+.SH SINOPSIS
+.B exitone
+.RI [ COMANDO " [" ARGUMENTOS ...]]
+.br
+.B exitone
+.br
+.B exitone repl
+.
+.SH DESCRIPCI\('ON
+.B exitone
+es una herramienta de l\('inea de comandos pensada para acompa\(~nar a un pentester
+(bug bounty en HackerOne, engagement interno con reglas de compromiso, o CTF)
+durante una investigaci\('on real. Observa evidencia real (salidas de nmap,
+smbclient, httpx, etc.), la correlaciona en un grafo de entidades/relaciones,
+y sugiere la siguiente acci\('on de mayor valor \(em pero
+.B nunca la ejecuta
+por su cuenta: el operador humano decide y ejecuta siempre.
+.PP
+Invocado sin argumentos (o con el subcomando
+.BR repl ),
+.B exitone
+entra a la
+.B Control Console
+interactiva, una consola de navegaci\('on inspirada en los patrones cognitivos de
+.BR msfconsole (1)
+(\fBuse\fR/\fBback\fR/\fBshow\fR/\fBsearch\fR/\fBinfo\fR, autocompletado, historial
+persistente) aplicados al dominio propio de ExitOne \(em nunca su est\('etica ni
+sus conceptos de explotaci\('on. Cualquier otro subcomando se ejecuta una sola
+vez y termina (modo CLI cl\('asico).
+.PP
+ExitOne administra su propio modelo de lenguaje local (\fBllama-server\fR) como
+un sidecar propio: lo arranca autom\('aticamente la primera vez que hace falta
+(ver \fBVARIABLES DE ENTORNO\fR y \fBARCHIVOS\fR) \(em el operador nunca tiene que
+arrancarlo a mano en otra terminal.
+.
+.SH MODOS
+.TP
+.B Control Console (interactiva)
+.B "exitone"
+o
+.B "exitone repl"
+\(em navegaci\('on tipo msfconsole sobre el estado de la investigaci\('on. V\('ease
+.B "CONTROL CONSOLE"
+m\('as abajo para la lista completa de comandos.
+.TP
+.B CLI de un solo comando
+.B "exitone <comando> [argumentos...]"
+\(em ejecuta un comando puntual y termina; \('util para scripts o para los hooks
+de shell (\fBcontrib/exitone-hooks.zsh\fR). V\('ease
+.B "COMANDOS (MODO CLI)"
+m\('as abajo.
+.TP
+.B TUI (dashboard embebido)
+.B "exitone start <target>"
+o
+.B "exitone tui"
+\(em una terminal real embebida junto a un panel lateral que se actualiza solo,
+para dejarlo corriendo mientras se trabaja. Se abre como subproceso separado
+tanto desde el modo CLI como desde la Control Console (\fBstart\fR/\fBtui\fR/\fBwatch\fR
+dentro de la consola).
+.
+.SH "CONTROL CONSOLE"
+Comandos disponibles dentro de la consola interactiva (\fBexitone\fR sin
+argumentos), agrupados por categor\('ia tal como los agrupa \fBhelp\fR/\fB?\fR dentro
+de la propia consola. El prompt refleja la profundidad de navegaci\('on actual,
+p.ej. \fBexitone host(192.168.1.10) >\fR o \fBexitone service(445/smb) >\fR.
+.
+.SS Core
+.TP
+.BI "help " "[comando] [--all]" ", " ?
+Ayuda contextual, agrupada por categor\('ia. \fB?\fR es exactamente el mismo
+comando, nunca uno distinto.
+.TP
+.BR exit ", " quit ", " q
+Salir de la consola.
+.TP
+.BR clear ", " cls
+Limpiar la pantalla.
+.
+.SS Navegaci\('on
+.TP
+.BI "show " "<hosts|services|objectives|hypotheses|candidates|coverage|focus|evidence> [--all]"
+Listar objetos del workspace activo, filtrados por el contexto de navegaci\('on
+actual salvo que se pase \fB--all\fR. Cada fila queda indexada para \fBuse\fR.
+Alias directos: \fBhosts\fR, \fBservices\fR, \fBhypotheses\fR, \fBcoverage\fR.
+.TP
+.BI "use " "<\('indice|ID|token>"
+Navegar a un objeto \(em pura navegaci\('on, nunca ejecuta nada, nunca cambia
+estrategia ni acepta candidatos. El \('indice num\('erico contra la \('ultima tabla
+mostrada siempre tiene prioridad; si no es v\('alido, se intenta resoluci\('on por
+identidad (prefijo de ID de hip\('otesis/objective/candidate, IP/dominio de host,
+o puerto exacto dentro de un contexto de host).
+.TP
+.B back
+Volver al contexto de navegaci\('on anterior. Nunca falla, ni siquiera en la ra\('iz
+del workspace.
+.TP
+.B info
+Detalle del objeto actualmente cargado en el contexto de navegaci\('on (workspace,
+host, service, objective, hypothesis o candidate).
+.TP
+.BI "search " "[type:<t>] [status:<s>] [host:<ip>] <texto>"
+Buscar entre hosts, services, objectives, hypotheses y candidates a la vez,
+combinando filtros \fIclave:valor\fR con texto libre.
+.
+.SS Scope
+.TP
+.BI "scope add " "<patr\('on> [--out] [--note \(dq...\(dq]"
+Registrar una regla de alcance (flujo bug bounty / reglas de compromiso):
+sin \fB--out\fR marca el patr\('on como autorizado; con \fB--out\fR lo excluye
+expl\('icitamente aunque coincida con una regla de alcance m\('as amplia. El
+matching es por substring/prefijo simple contra IP/dominio, no aritm\('etica
+real de CIDR.
+.TP
+.B "scope list"
+Listar todas las reglas de scope del workspace activo.
+.TP
+.BI "scope remove " "<ID|patr\('on>"
+Borrar una regla, por prefijo de ID o coincidencia exacta de patr\('on.
+.PP
+El estado de scope (\fBin\fR/\fBOUT\fR/\fB?\fR) se muestra como columna en
+\fBshow hosts\fR, \fBshow services\fR, \fBshow candidates\fR y \fBnext\fR contextual,
+y como advertencia al hacer \fBuse\fR sobre un host/servicio excluido. Nunca
+bloquea la navegaci\('on ni oculta nada \(em solo lo marca.
+.
+.SS Workspace
+.TP
+.BI "workspace new " "<target-label>"
+Crear (o reanudar, si ya existe una sesi\('on abierta con la misma etiqueta) un
+workspace de investigaci\('on.
+.TP
+.BI "workspace use " "<etiqueta|ID>"
+Cambiar de workspace activo. Si la etiqueta coincide con m\('as de un workspace,
+nunca elige uno solo: lista todos y pide el ID completo.
+.TP
+.B "workspace list"
+Listar todos los workspaces conocidos (ID corto, etiqueta, estado, fecha).
+.TP
+.B "workspace info"
+Resumen del workspace activo (hosts, services, objectives, hypotheses).
+.TP
+.BI "session " "..."
+Alias legacy de \fBworkspace\fR \(em mismo comportamiento exacto, para
+compatibilidad con scripts/h\('abitos previos a la Control Console.
+.
+.SS Strategy
+.TP
+.BI "hypothesis " "<list|open|support|contradict|confirm|refute> ..."
+Ciclo expl\('icito de hip\('otesis falsables: \fBopen <entity-ref> <statement>\fR abre
+una nueva; \fBsupport\fR/\fBcontradict <hypothesis-id> <observation-id>\fR vinculan
+evidencia a favor o en contra; \fBconfirm\fR/\fBrefute <id>\fR la cierran. Nunca se
+reabre interpretando texto, solo por comparaci\('on estructural de evidencia.
+.TP
+.BI "objective " "<list|add|complete|abandon> ..." ", " objectives
+Objetivos finales definidos por el operador (distintos de los
+\fImethodology objective\fR autom\('aticos de \fBshow objectives\fR): \fBadd
+<statement>\fR crea uno; \fBcomplete\fR/\fBabandon <id> [--evidence <ref>]\fR lo cierra.
+.TP
+.BR "next " "[--raw]"
+Sugerencias rankeadas (\fIAction Intents\fR). Fuera de un contexto de
+navegaci\('on, es el ranking global; dentro de un contexto (host, service,
+objective, hypothesis, candidate), agrupa la misma lista en \(lqRelated to
+\&...\(rq / \(lqOther suggestions\(rq \(em nunca recalcula nada ni toca \fBfocus\fR.
+.TP
+.BI "why " "<candidate-id-prefix>"
+Explicar por qu\('e se sugiri\('o un candidato (t\('erminos del score).
+.TP
+.BI "accept " "<candidate-id-prefix>"
+Aceptar un candidato: registra la acci\('on propuesta.
+.B "ExitOne nunca la ejecuta autom\('aticamente"
+\(em el operador la corre \('el mismo y luego ingiere el resultado.
+.TP
+.BI "resolve " "<action-id-prefix> --result fail|success"
+Cerrar/confirmar una hip\('otesis tras probar algo manualmente.
+.TP
+.BI "dismiss " "<candidate-id-prefix>"
+Descartar una sugerencia obsoleta.
+.TP
+.BI "focus " "[<hypothesis-or-objective-id-prefix>|clear]"
+D\('onde invertir esfuerzo ahora mismo \(em siempre expl\('icito, nunca inferido.
+Sin argumentos, muestra el focus activo si hay uno. Distinto de \fBuse\fR:
+\fBuse\fR es navegaci\('on/presentaci\('on, \fBfocus\fR es prioridad real de estrategia.
+.
+.SS Mentor
+.TP
+.B guide
+Modo mentor proactivo: sugiere por d\('onde seguir narrando, en lenguaje llano,
+las etapas reales de la investigaci\('on y el candidato de mayor score ya
+calculado \(em nunca inventa una t\('ecnica nueva. Si el candidato apunta a un
+asset marcado \fBEXCLUIDO\fR en \fBscope\fR, lo advierte primero que cualquier
+otra cosa.
+.TP
+.BI "explain " "[tecnolog\('ia|servicio]"
+Modo mentor: explica, en t\('erminos gen\('ericos de metodolog\('ia, una tecnolog\('ia
+detectada (p.ej. \(lqSamba smbd 3.X\(rq, \(lqCUPS\(rq). Sin argumentos, toma el
+sujeto del contexto de navegaci\('on activo (service/objective/hypothesis).
+Deliberadamente nunca ve el estado de la sesi\('on: no puede, por construcci\('on,
+afirmar una vulnerabilidad espec\('ifica de este target.
+.
+.SS Evidence
+.TP
+.BI "ingest " "<archivo> [--tool <hint>] [--host <ip>]"
+Ingerir evidencia manualmente. Agn\('ostico a la herramienta: detecta el
+formato por contenido (nmap, smbclient, XML/JSON/tabla gen\('erico); si no
+reconoce nada, cae a extracci\('on Nivel 2 v\('ia LLM local con confianza acotada.
+.TP
+.BI "credential " "<add|list|attempt> ..." ", " credentials
+Recordar credenciales descubiertas y sus intentos de uso.
+\fBadd --value <secreto> [--identity <ref>] [--service <ref>] [--source <ref>]\fR
+la guarda; \fBlist [--reveal]\fR la muestra enmascarada por defecto \(em el valor
+real solo se imprime con \fB--reveal\fR expl\('icito; \fBattempt <id> --result
+success|fail|unknown\fR registra si funcion\('o. Comando marcado
+.B Sensitive
+\(em la l\('inea completa nunca se guarda en el historial de la consola.
+.TP
+.BI "observation " "<list|confirm|reject> ..." ", " observations
+Revisar observaciones candidatas propuestas por el LLM (extracci\('on Nivel 2,
+confianza siempre acotada) antes de que cuenten como hecho confirmado.
+\fBconfirm <id-prefix>\fR la acepta y reeval\('ua la metodolog\('ia/candidatos;
+\fBreject\fR la descarta.
+.TP
+.BI "ask " "\(dq<pregunta>\(dq"
+Consulta en lenguaje natural anclada al estado real de la investigaci\('on
+(Hybrid GraphRAG: clasificaci\('on de intenci\('on + recuperaci\('on determinista
+del subgrafo relevante + redacci\('on final por el LLM).
+.TP
+.B status
+Estado completo: entidades, relaciones y methodology objectives.
+.TP
+.B stages
+Etapas de la investigaci\('on y su estado real
+(\fBNOT_STARTED\fR/\fBACTIVE\fR/\fBPARTIAL\fR/\fBSUFFICIENT\fR/\fBBLOCKED\fR/\fBREOPENED\fR).
+.
+.SS Terminal
+.TP
+.BR "watch " "[--interval <segundos>]"
+Dashboard en vivo de solo lectura, pensado para un pane aparte.
+.TP
+.BI "start " "<target> [--tmux]"
+Terminal embebida real + panel lateral en vivo.
+.TP
+.B tui
+La aplicaci\('on completa directamente, sobre la sesi\('on ya activa.
+.PP
+Estos tres se ejecutan siempre como subproceso real (nunca en el mismo
+proceso que la Control Console), para no anidar dos gestores de terminal en
+modo raw.
+.
+.SH "COMANDOS (MODO CLI)"
+Los mismos comandos de \fBStrategy\fR/\fBEvidence\fR/\fBTerminal\fR de arriba
+tambi\('en existen como subcomando directo de \fBexitone\fR fuera de la consola,
+para uso en scripts:
+.PP
+.RS
+.nf
+exitone session new <target\-label>
+exitone ingest <archivo> [\-\-tool <hint>] [\-\-host <ip>] [\-\-for\-action <id\-prefix>]
+exitone ingest identities <archivo.txt> \-\-source <origen>
+exitone ingest watch <directorio>
+exitone credential add \-\-value <secreto> [\-\-identity <ref>] [\-\-service <ref>] [\-\-source <ref>]
+exitone credential list [\-\-reveal]
+exitone credential attempt <id> \-\-result success|fail|unknown [\-\-service <ref>] [\-\-event <ref>]
+exitone observation <list|confirm|reject> ...
+exitone hypothesis <list|open|support|contradict|confirm|refute> ...
+exitone objective <list|add|complete|abandon> ...
+exitone next [\-\-raw]
+exitone why <candidate\-id\-prefix>
+exitone status
+exitone accept <candidate\-id\-prefix>
+exitone resolve <action\-id\-prefix> \-\-result <fail|success>
+exitone stages
+exitone dismiss <candidate\-id\-prefix>
+exitone focus <hypothesis\-or\-objective\-id\-prefix>
+exitone focus clear
+exitone focus
+exitone ask "<pregunta>"
+exitone watch [\-\-interval <segundos>]
+exitone start <target> [\-\-tmux]
+exitone tui
+.fi
+.RE
+.PP
+Adem\('as existen dos subcomandos de uso
+.B puramente interno
+(invocados por los hooks de shell y por el propio ExitOne, nunca pensados
+para tipearse a mano): \fBobserve-event --event '<json>'\fR y
+\fBstrategy-worker <session-id> <revision>\fR. Se documentan aqu\('i solo por
+transparencia.
+.
+.SH "VARIABLES DE ENTORNO"
+.TP
+.B EXITONE_LLM_URL
+URL base de la API compatible con OpenAI del LLM local.
+Por defecto \fBhttp://127.0.0.1:8090/v1\fR. Si se fija expl\('icitamente, ExitOne
+asume que el operador administra ese servidor \('el mismo (posiblemente remoto)
+y nunca intenta arrancar nada ah\('i.
+.TP
+.B EXITONE_ALLOW_REMOTE_LLM
+Debe valer \fB1\fR para permitir que \fBEXITONE_LLM_URL\fR apunte a un host que
+no sea \fBlocalhost\fR/\fB127.0.0.1\fR/\fB::1\fR. Sin esto, ExitOne rechaza mandar
+contexto de la investigaci\('on a un endpoint remoto por un simple cambio
+accidental de variable de entorno.
+.TP
+.B EXITONE_LLM_MODEL
+Identificador de modelo enviado al endpoint. Por defecto \fBqwen2.5-3b\fR.
+.TP
+.B EXITONE_LLM_SERVER_BIN
+Ruta expl\('icita al binario \fBllama-server\fR. Si no se fija, ExitOne busca en
+\fB~/.exitone/llm/bin/llama-server\fR y luego en el \fBPATH\fR.
+.TP
+.B EXITONE_LLM_MODEL_PATH
+Ruta expl\('icita a un modelo \fB.gguf\fR. Si no se fija, ExitOne usa el primero
+que encuentre en \fB~/.exitone/llm/models/\fR.
+.TP
+.B EXITONE_DEBUG_LOG
+Ruta alternativa para el log de depuraci\('on estructurado. Por defecto
+\fB~/.exitone/ultra_debug.log\fR.
+.TP
+.B EXITONE_EVENTS_LOG
+Ruta del log de eventos de los hooks de shell (\fBcontrib/exitone-hooks.zsh\fR).
+Por defecto \fB~/.exitone/events.jsonl\fR.
+.
+.SH ARCHIVOS
+.TP
+.I ~/.exitone/exitone.db
+Base de datos SQLite \(em todo el estado de todas las investigaciones,
+incluyendo el valor real de las credenciales guardadas con \fBcredential add\fR
+(enmascaradas solo en pantalla, \fBno cifradas en disco\fR). Tr\('atese este
+archivo como sensible.
+.TP
+.I ~/.exitone/history
+Historial persistente de la Control Console. Las l\('ineas con banderas
+sensibles (\fB\-\-password\fR, \fB\-\-token\fR, \fB\-\-secret\fR, \fB\-\-api\-key\fR) se
+excluyen autom\('aticamente, nunca se escriben en disco.
+.TP
+.I ~/.exitone/ultra_debug.log
+Log JSON-lines verboso: cada comando, decisi\('on interna y tr\('afico con el LLM.
+.B Contiene datos potencialmente sensibles de la investigaci\('on
+\(em tr\('atese como tal.
+.TP
+.I ~/.exitone/events.jsonl
+Eventos capturados por los hooks de shell (comando, cwd, exit code).
+.TP
+.I ~/.exitone/streams/
+Espejo en vivo de la salida de la terminal embebida (TUI), por sesi\('on.
+.TP
+.I ~/.exitone/llm/bin/llama-server
+Ubicaci\('on propia del binario del servidor LLM local (ver \fBEXITONE_LLM_SERVER_BIN\fR).
+.TP
+.I ~/.exitone/llm/models/*.gguf
+Ubicaci\('on propia de los pesos del modelo local (ver \fBEXITONE_LLM_MODEL_PATH\fR).
+.TP
+.I ~/.exitone/llm/server.log
+.TQ
+.I ~/.exitone/llm/server.pid
+Log y PID del \fBllama-server\fR administrado autom\('aticamente por ExitOne.
+.
+.SH EJEMPLOS
+Arrancar una investigaci\('on nueva y entrar a la consola:
+.RS
+.nf
+$ exitone session new 192.168.1.10
+$ exitone
+exitone(192.168.1.10) > next
+exitone(192.168.1.10) > use 0
+exitone service(445/smb) > info
+exitone service(445/smb) > explain
+exitone service(445/smb) > back
+exitone(192.168.1.10) > guide
+.fi
+.RE
+.PP
+Marcar un rango como fuera de programa en un bug bounty:
+.RS
+.nf
+exitone(acme-corp) > scope add acme.com
+exitone(acme-corp) > scope add internal.acme.com \-\-out \-\-note "excluido por el cliente"
+exitone(acme-corp) > show hosts
+.fi
+.RE
+.PP
+Uso en modo CLI (scripting):
+.RS
+.nf
+$ exitone ingest nmap_scan.xml \-\-host 192.168.1.10
+$ exitone next \-\-raw
+$ exitone accept a1b2c3d4
+.fi
+.RE
+.
+.SH "LIMITACIONES CONOCIDAS"
+.IP \(bu 2
+El matching de \fBscope\fR es substring/prefijo simple, no aritm\('etica real de
+rangos CIDR.
+.IP \(bu 2
+.B credential add
+guarda el secreto en texto plano en \fB~/.exitone/exitone.db\fR \(em el
+enmascarado de \fBcredential list\fR es solo de presentaci\('on, no cifrado en
+disco.
+.IP \(bu 2
+El LLM local (t\('ipicamente un modelo peque\(~no de 3B) puede cometer errores de
+redacci\('on aun con el contexto correcto \(em ExitOne separa siempre el c\('alculo
+determinista (Go) de la redacci\('on (LLM), pero la redacci\('on final no est\('a
+garantizada palabra por palabra.
+.IP \(bu 2
+.B exitone
+nunca ejecuta comandos contra un target por s\('i mismo, bajo ninguna
+circunstancia \(em esto es un l\('imite de dise\(~no, no una limitaci\('on a resolver.
+.
+.SH "V\('EASE TAMBI\('EN"
+.BR nmap (1),
+.BR smbclient (1),
+.BR tmux (1)
+.
+.SH AUTOR
+Proyecto ExitOne (\fBhttps://github.com/neavus-23/exitone\fR).
+.
+.SH ERRORES
+Reportar problemas en el repositorio del proyecto.

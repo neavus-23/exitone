@@ -82,6 +82,9 @@ func GenerateEndpointFollowupCandidates(s *store.Store, sessionID string, newEnt
 			UncertaintyReduction: 0.6,
 			RedundancyPenalty:    0,
 		}
+		if err := ApplyHistoricalOutcome(s, sessionID, "inspect_endpoint", &terms); err != nil {
+			return nil, err
+		}
 		score := terms.UtilityScore()
 
 		explanation := fmt.Sprintf(
@@ -99,8 +102,10 @@ func GenerateEndpointFollowupCandidates(s *store.Store, sessionID string, newEnt
 		if _, err := s.DB.Exec(`
 			INSERT INTO candidate(
 				id, session_id, source, objective_path_id, intent_key, parameters,
-				tool, command_template_rendered, score, score_terms, explanation, created_at, status
-			) VALUES (?, ?, 'methodology', NULL, 'inspect_endpoint', ?, ?, ?, ?, ?, ?, ?, 'proposed')`,
+				tool, command_template_rendered, score, score_terms, explanation, created_at, status,
+				phase_key, expected_evidence
+			) VALUES (?, ?, 'methodology', NULL, 'inspect_endpoint', ?, ?, ?, ?, ?, ?, ?, 'proposed',
+				'enumeration', 'Respuesta HTTP, headers y contenido del endpoint')`,
 			candID, sessionID, string(params),
 			rendered.Tool, rendered.FormatForShell(), score, string(termsJSON), explanation, now,
 		); err != nil {
