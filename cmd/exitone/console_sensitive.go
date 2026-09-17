@@ -55,7 +55,7 @@ type readlineHistorySource interface {
 	Write(line string) (int, error)
 	GetLine(pos int) (string, error)
 	Len() int
-	Dump() interface{}
+	Dump() any
 }
 
 func (f *filteredHistory) Write(line string) (int, error) {
@@ -73,7 +73,7 @@ func (f *filteredHistory) Write(line string) (int, error) {
 
 func (f *filteredHistory) GetLine(pos int) (string, error) { return f.inner.GetLine(pos) }
 func (f *filteredHistory) Len() int                        { return f.inner.Len() }
-func (f *filteredHistory) Dump() interface{}               { return f.inner.Dump() }
+func (f *filteredHistory) Dump() any                       { return f.inner.Dump() }
 
 func firstTokenAndRest(line string) (string, []string) {
 	tokens := tokenizeConsoleLine(line)

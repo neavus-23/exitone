@@ -35,9 +35,9 @@ const (
 // observaciones del mismo escaneo no son dos fuentes independientes, así que
 // no se inflan a una confianza que el sistema no puede respaldar todavía.
 type Explanation struct {
-	Statement              string
-	Status                 Status
-	SupportingObservations int
+	Statement                 string
+	Status                    Status
+	SupportingObservations    int
 	ContradictingObservations int
 }
 
@@ -131,9 +131,9 @@ func recomputeStatus(s *store.Store, hypothesisID, newRelation string) error {
 // Todos son opcionales: una hipótesis cerrada sin detalle sigue siendo
 // válida, solo que el reporte final la mostrará sin severidad/remediación.
 type FindingDetails struct {
-	Severity      string // '' | low | medium | high | critical
-	Remediation   string
-	EvidenceNote  string // prueba de impacto puntual, ej. un flag o un output concreto
+	Severity     string // '' | low | medium | high | critical
+	Remediation  string
+	EvidenceNote string // prueba de impacto puntual, ej. un flag o un output concreto
 }
 
 // Confirm es un cierre EXPLÍCITO (nunca automático por conteo) — el llamador

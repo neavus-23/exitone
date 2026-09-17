@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"exitone/internal/debuglog"
 	"exitone/internal/llm"
 	"exitone/internal/store"
 
@@ -284,7 +285,12 @@ func insertExploratoryCandidate(s *store.Store, sessionID string, revision int64
 		if role == "" {
 			role = "supports"
 		}
-		_, _ = s.DB.Exec(`INSERT OR IGNORE INTO candidate_basis(candidate_id, ref_type, ref_id, role) VALUES (?, ?, ?, ?)`, id, basis.RefType, basis.RefID, role)
+		if _, err := s.DB.Exec(`INSERT OR IGNORE INTO candidate_basis(candidate_id, ref_type, ref_id, role) VALUES (?, ?, ?, ?)`, id, basis.RefType, basis.RefID, role); err != nil {
+			// El candidate en sí ya se insertó (lo que importa para que
+			// aparezca en `next`); una fila de basis perdida solo degrada
+			// la explicación de `why`, no debe abortar todo el candidato.
+			debuglog.LogError("candidate_basis_insert", err, map[string]any{"candidate_id": id, "ref_type": basis.RefType, "ref_id": basis.RefID})
+		}
 	}
 	return true, nil
 }
@@ -311,6 +317,12 @@ func finishJob(s *store.Store, sessionID string, revision int64, status string, 
 	if jobErr != nil {
 		message = jobErr.Error()
 	}
-	_, _ = s.DB.Exec(`UPDATE strategy_job SET status=?, last_error=?, finished_at=? WHERE session_id=? AND revision=?`,
-		status, message, time.Now().UTC().Format(time.RFC3339Nano), sessionID, revision)
+	if _, err := s.DB.Exec(`UPDATE strategy_job SET status=?, last_error=?, finished_at=? WHERE session_id=? AND revision=?`,
+		status, message, time.Now().UTC().Format(time.RFC3339Nano), sessionID, revision); err != nil {
+		// Sin este log, un strategy_job que se queda pegado en 'running'
+		// para siempre (porque el UPDATE de cierre falló) es indistinguible
+		// de un trabajo genuinamente lento — el operador vería "razonando…"
+		// sin fin y no habría rastro de por qué.
+		debuglog.LogError("strategy_job_finish", err, map[string]any{"session": sessionID, "revision": revision, "status": status})
+	}
 }

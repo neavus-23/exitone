@@ -171,7 +171,7 @@ Known sensitive flags such as `--password`, `--pass`, `--token`, `--secret`, and
 
 ### 2. TUI — live shell workflow
 
-`exitone start <target>` opens a single application with a real PTY-backed shell and a live investigation panel. Both panes start at 50/50, have independent vertical scrollbars, and can be resized by dragging the divider or with the keyboard.
+`exitone start [target]` opens a single application with a real PTY-backed shell and a live investigation panel. The target is optional: with no workspace active, the TUI itself asks what to do before the shell starts — zero open workspaces prompts for a new target, exactly one resumes automatically with no prompt at all, and two or more show a navigable picker (`↑/↓`, `Enter`, `n` for a new one). `exitone tui` behaves the same way when invoked directly. Once a workspace is active, both panes start at 50/50, have independent vertical scrollbars, and can be resized by dragging the divider or with the keyboard.
 
 ```text
 ┌────────────────────── ▶ OPERATOR ──┐│┌────────────────── EXITONE ───────┐
@@ -220,21 +220,9 @@ In `VAULT`, identities group their linked credentials and credentials without an
 
 The active pane is identified by both a `▶` marker and color, so focus remains visible in monochrome terminals. The embedded TUI mirrors raw PTY bytes into its own stream file under `~/.exitone/streams/`. When the Zsh hooks are loaded, they use this stream to delimit each completed command and submit its output to the existing ingestion pipeline. tmux `pipe-pane` remains a fallback rather than the primary capture mechanism.
 
-### 3. Read-only dashboard
+### 3. Read-only dashboard and observable tmux layout
 
-```text
-┌────────────────────────────────────────────────────────────┐
-│                      E X I T O N E                         │
-│          exit code 1 — algo requiere investigación        │
-└────────────────────────────────────────────────────────────┘
-  observa · correlaciona · sugiere — el humano decide y ejecuta
-
-exitone(target) > next
-```
-
-### Read-only dashboard and observable tmux layout
-
-`exitone watch` continuously renders stages, top candidates, and open objectives. `exitone start <target> --tmux` creates four panes: `OPERATOR`, `EXITONE LIVE`, `EVIDENCE & EVENTS`, and `VALIDATION CONTROL`. Add `--session-name <name> --detach` to prepare a persistent session without immediately attaching; reconnect with `tmux attach -t <name>`.
+`exitone watch` continuously renders stages, top candidates, and open objectives. `exitone start <target> --tmux` (the target is required for this legacy layout — it doesn't go through the TUI's onboarding) creates four panes: `OPERATOR`, `EXITONE LIVE`, `EVIDENCE & EVENTS`, and `VALIDATION CONTROL`. Add `--session-name <name> --detach` to prepare a persistent session without immediately attaching; reconnect with `tmux attach -t <name>`.
 
 ---
 
@@ -270,7 +258,12 @@ mkdir -p "$HOME/.local/bin"
 install -m 0755 exitone "$HOME/.local/bin/exitone"
 ```
 
-Make sure `~/.local/bin` is in your `PATH`.
+Make sure `~/.local/bin` is in your `PATH`. Optionally install the man page too:
+
+```bash
+sudo install -m 0644 man/exitone.1 /usr/local/share/man/man1/exitone.1
+man exitone
+```
 
 Launch the Control Console:
 
@@ -421,28 +414,32 @@ These commands have different trust boundaries:
 
 ## Control Console command map
 
+> [!NOTE]
+> Most ID arguments below are optional: `why`, `accept`, `dismiss`, `resolve`, `hypothesis support/contradict/confirm/refute`, `credential attempt/update`, and `observation confirm/reject` will auto-select the target when **exactly one** eligible candidate exists in the session. With zero or several eligible candidates they behave exactly as documented — asking for (or listing) the explicit ID rather than guessing.
+
 | Category | Commands |
 | --- | --- |
-| `exitone start <target> [--tmux] [--session-name <name>] [--detach]` | Start/resume a target and launch the TUI or the persistent four-pane tmux layout |
+| `exitone start [target] [--tmux] [--session-name <name>] [--detach]` | Start/resume a target and launch the TUI, or (no target) let the TUI's onboarding pick/create the workspace; `--tmux` launches the legacy four-pane layout and still requires a target |
 | `exitone session new <target> [--fresh]` | Create or activate an investigation session |
-| `exitone ingest <file> [--tool <hint>] [--host <ip>] [--for-action <id>]` | Ingest tool output |
+| `exitone ingest <file> [--tool <hint>] [--host <ip>] [--for-action <id>]` | Ingest tool output; `--host` is only required when the session has more than one known host |
 | `exitone ingest identities <file> --source <source>` | Add one identity per line with provenance |
 | `exitone events [--tail N]` | Inspect captured command events and their automatic association state |
 | `exitone next [--raw]` | Show ranked proposed actions; `--raw` returns only the top command |
-| `exitone why <candidate-id>` | Explain the candidate and its score terms |
-| `exitone accept <candidate-id>` | Register an action and decision snapshot without executing it |
-| `exitone resolve <action-id> --result fail\|success` | Record the result of a modeled hypothesis test |
-| `exitone dismiss <candidate-id>` | Dismiss a stale or unwanted candidate |
-| `exitone observation <list\|confirm\|reject>` | Review low-trust LLM observations; confirmation is always explicit |
-| `exitone hypothesis <list\|open\|support\|contradict\|confirm\|refute>` | Manage hypotheses and their evidence links |
-| `exitone objective <list\|add\|complete\|abandon>` | Manage operator objectives independently of methodology gaps |
-| `exitone credential add\|list\|attempt` | Store and track credentials; values are masked unless `list --reveal` is used |
+| `exitone why [candidate-id]` | Explain the candidate and its score terms |
+| `exitone accept [candidate-id]` | Register an action and decision snapshot without executing it |
+| `exitone resolve [action-id] --result fail\|success` | Record the result of a modeled hypothesis test |
+| `exitone dismiss [candidate-id]` | Dismiss a stale or unwanted candidate |
+| `exitone observation <list\|confirm\|reject> [id]` | Review low-trust LLM observations; confirmation is always explicit |
+| `exitone hypothesis <list\|open\|support\|contradict\|confirm\|refute>` | Manage hypotheses and their evidence links; `confirm`/`refute` accept `--severity low\|medium\|high\|critical`, `--remediation <text>`, and `--evidence <note>`, which feed directly into `report`'s findings |
+| `exitone objective <list\|add\|complete\|abandon> [id]` | Manage operator objectives independently of methodology gaps |
+| `exitone credential add\|list\|attempt\|update` | Store, track, and relink credentials; values are masked unless `list --reveal` is used; `update` links identity/service to a credential found before either was known |
+| `exitone report [--reveal] [--raw] [--out <file>]` | Generate the final engagement report — scope, executive summary, findings, credentials, timeline, and open methodology questions from real session state; the prose is written by the local LLM in small, bounded, per-section calls (`--raw` skips the LLM for a fully deterministic version) |
 | `exitone scope add\|list\|remove` | Record explicit in/out-of-scope rules; violations are warned prominently but not technically blocked |
 | `exitone status` | Show entities and methodology objectives |
 | `exitone stages` | Show evidence-derived investigation stages |
 | `exitone ask "<question>"` | Query structured investigation state through Hybrid GraphRAG |
 | `exitone watch [--interval <seconds>]` | Read-only live dashboard |
-| `exitone tui` | Launch the TUI for an already-active session |
+| `exitone tui` | Launch the TUI directly — same onboarding as `start` with no target if no workspace is active |
 
 ---
 
@@ -847,20 +844,23 @@ exitone/
 ├── cmd/exitone/          # CLI, Control Console, dashboard, embedded-terminal TUI
 ├── contrib/              # Zsh hooks and Ctrl+Space widget
 ├── db/                   # readable schema reference
-├── docs/                 # manual validation documentation
+├── docs/                 # manual validation documentation + GitHub Pages landing
+├── man/                  # exitone(1) man page
 ├── internal/
+│   ├── activity/         # shell-observed command ↔ candidate association
 │   ├── commandengine/    # deterministic command rendering + provenance
 │   ├── console/          # command registry, context stack, result sets, search/tables
+│   ├── credential/       # credential storage, masking, reveal, attempt tracking
 │   ├── debuglog/         # structured diagnostic logging
 │   ├── focus/            # explicit operator focus
 │   ├── hypothesis/       # falsifiable hypothesis + observation lifecycle
 │   ├── ingestsource/     # artifact source interface + directory watcher
 │   ├── investigation/    # event/evidence/observation/entity/relationship model
-│   ├── llm/              # local lifecycle, fallback extraction, GraphRAG, guide/explain
+│   ├── llm/              # local lifecycle, fallback extraction, GraphRAG, guide/explain, report narration
 │   ├── methodology/      # entity-driven objectives and paths
-│   ├── models/           # domain structs
 │   ├── outcome/          # action outcomes
 │   ├── parsers/          # deterministic and generic shape-based extraction
+│   ├── report/           # final engagement report assembly (backs `exitone report`)
 │   ├── scope/            # explicit engagement scope rules
 │   ├── stage/            # evidence-derived investigation coverage estimator
 │   ├── store/            # SQLite store + embedded schema

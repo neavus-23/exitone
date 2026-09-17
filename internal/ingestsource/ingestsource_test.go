@@ -10,7 +10,7 @@ import (
 )
 
 type recordingSink struct {
-	mu      sync.Mutex
+	mu       sync.Mutex
 	accepted []string
 }
 

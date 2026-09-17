@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"exitone/internal/debuglog"
 	"exitone/internal/store"
 
 	"github.com/google/uuid"
@@ -176,7 +177,13 @@ func RecordAttempt(s *store.Store, sessionID, credentialRef, serviceRef, eventRe
 		if result == "fail" {
 			status = "invalid"
 		}
-		_, _ = s.DB.Exec(`UPDATE credential SET status = ? WHERE id = ?`, status, credentialID)
+		if _, err := s.DB.Exec(`UPDATE credential SET status = ? WHERE id = ?`, status, credentialID); err != nil {
+			// El intento ya quedó registrado (lo importante para el historial);
+			// no fallar la llamada por esto, pero tampoco perder el error en
+			// silencio — sin este log, un status desactualizado sería
+			// indistinguible de un intento con resultado 'unknown'.
+			debuglog.LogError("credential_status_update", err, map[string]any{"credential_id": credentialID, "status": status})
+		}
 	}
 	return id, nil
 }
