@@ -842,7 +842,14 @@ func (m *tuiModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.recallChatQuestion(1)
 		m.sidebar = renderSidebar(m)
 		return m, nil
-	case "backspace":
+	case "backspace", "ctrl+h":
+		// Bug real reportado probando en vivo: en algunas terminales (según
+		// su configuración stty erase) la tecla Backspace física manda el
+		// byte ASCII BS (0x08) en vez de DEL (0x7f) — bubbletea reporta eso
+		// como "ctrl+h", no "backspace". El shell embebido lo disimula
+		// porque readline/zle también tratan Ctrl+H como borrar-atrás, pero
+		// los editores de línea propios de ExitOne (chat, filtros, el input
+		// de onboarding) no tenían ese alias y se quedaban sin reaccionar.
 		runes := []rune(m.chatInput)
 		if m.chatCursor > 0 && m.chatCursor <= len(runes) {
 			runes = append(runes[:m.chatCursor-1], runes[m.chatCursor:]...)
@@ -1023,7 +1030,7 @@ func (m *tuiModel) handleGraphKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.graphFilterCursor = 0
 		case "end", "ctrl+e":
 			m.graphFilterCursor = len([]rune(m.graphFilter))
-		case "backspace":
+		case "backspace", "ctrl+h":
 			runes := []rune(m.graphFilter)
 			if m.graphFilterCursor > 0 && m.graphFilterCursor <= len(runes) {
 				runes = append(runes[:m.graphFilterCursor-1], runes[m.graphFilterCursor:]...)
@@ -1173,7 +1180,7 @@ func (m *tuiModel) handleVaultKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.vaultFilterCursor = 0
 		case "end", "ctrl+e":
 			m.vaultFilterCursor = len([]rune(m.vaultFilter))
-		case "backspace":
+		case "backspace", "ctrl+h":
 			runes := []rune(m.vaultFilter)
 			if m.vaultFilterCursor > 0 && m.vaultFilterCursor <= len(runes) {
 				runes = append(runes[:m.vaultFilterCursor-1], runes[m.vaultFilterCursor:]...)
@@ -1428,7 +1435,7 @@ func (m *tuiModel) handleOnboardingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		return m.submitOnboarding()
-	case "backspace":
+	case "backspace", "ctrl+h":
 		if r := []rune(m.onboarding.newLabel); len(r) > 0 {
 			m.onboarding.newLabel = string(r[:len(r)-1])
 		}
