@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ExitOne — terminal-native investigation engine</title>
+<meta name="description" content="ExitOne is a terminal-native investigation engine for pentesting, labs, and CTF-style security research. Deterministic before generative — a local LLM narrates, it never decides or executes.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛰️</text></svg>">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #12161b;
+    --border: #232a32;
+    --fg: #e6edf3;
+    --dim: #8b98a5;
+    --accent: #6c63ff;
+    --accent-2: #00adb5;
+    --green: #3fb950;
+    --amber: #f5a623;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  code, pre, .mono {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  a { color: var(--accent-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+
+  header.hero {
+    padding: 72px 0 40px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .badge-row {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 18px 0 28px;
+  }
+  .badge {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--dim);
+  }
+  h1 {
+    font-size: 2.6rem;
+    letter-spacing: 0.02em;
+    margin: 0;
+  }
+  h1 .accent { color: var(--accent); }
+  .tagline {
+    font-family: "SFMono-Regular", Consolas, monospace;
+    color: var(--dim);
+    font-size: 1.05rem;
+    margin-top: 10px;
+  }
+  .lede {
+    max-width: 640px;
+    margin: 22px auto 0;
+    color: var(--dim);
+    font-size: 1.02rem;
+  }
+
+  .cta-row {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 30px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-block;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .btn.primary {
+    background: var(--accent);
+    color: white;
+  }
+  .btn.primary:hover { text-decoration: none; filter: brightness(1.1); }
+  .btn.secondary {
+    border: 1px solid var(--border);
+    color: var(--fg);
+  }
+  .btn.secondary:hover { text-decoration: none; border-color: var(--accent-2); }
+
+  section { padding: 48px 0; border-bottom: 1px solid var(--border); }
+  section:last-of-type { border-bottom: none; }
+  h2 {
+    font-size: 1.4rem;
+    margin-bottom: 18px;
+  }
+
+  .terminal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    color: #c9d1d9;
+    white-space: pre;
+  }
+  .terminal .prompt { color: var(--accent-2); }
+  .terminal .ok { color: var(--green); }
+  .terminal .warn { color: var(--amber); }
+  .terminal .dim { color: var(--dim); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 18px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .card h3 {
+    margin: 0 0 8px;
+    font-size: 1rem;
+    color: var(--fg);
+  }
+  .card p {
+    margin: 0;
+    color: var(--dim);
+    font-size: 0.92rem;
+  }
+
+  .install pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.88rem;
+  }
+
+  footer {
+    padding: 32px 0 60px;
+    text-align: center;
+    color: var(--dim);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>EXIT<span class="accent">ONE</span></h1>
+    <div class="tagline">observe · correlate · suggest — the human decides and executes</div>
+    <p class="lede">
+      A terminal-native investigation engine for pentesting, labs, and CTF-style security research.
+      Structured facts are parsed and correlated in Go first; a local LLM only narrates,
+      explains, and fills genuine gaps — it never invents a finding and never runs a command on its own.
+    </p>
+    <div class="badge-row">
+      <span class="badge">Go 1.27</span>
+      <span class="badge">SQLite · local state</span>
+      <span class="badge">Control Console · TUI · CLI</span>
+      <span class="badge">local / OpenAI-compatible LLM</span>
+      <span class="badge">MIT licensed</span>
+    </div>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/neavus-23/exitone">View on GitHub</a>
+      <a class="btn secondary" href="https://github.com/neavus-23/exitone#readme">Read the docs</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What it looks like</h2>
+    <div class="terminal">┌────────────────────────────────────────────────────────────┐
+│                      E X I T O N E                         │
+│          exit code 1 — algo requiere investigación        │
+└────────────────────────────────────────────────────────────┘
+  observe · correlate · suggest — the human decides and executes
+
+<span class="prompt">exitone(target) &gt;</span> next
+<span class="ok">0.90</span>  NMAP · discovery/low
+<span class="dim">$ nmap -sV -sC -p- 10.10.10.10 -oG nmap_full_10_10_10_10.txt</span>
+
+<span class="prompt">exitone(target) &gt;</span> accept c3f1a9
+<span class="ok">✓</span> action registered — <span class="warn">ExitOne does not execute it for you</span>
+
+<span class="prompt">exitone(target) &gt;</span> report --reveal --out report.md
+<span class="dim">writing scope, findings, credentials, timeline… narrated by the local LLM</span></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Why ExitOne</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Deterministic before generative</h3>
+        <p>Every fact, score, and stage comes from a real row in SQLite. The LLM narrates what Go already computed — it never gets to invent a finding, a credential, or a next step.</p>
+      </div>
+      <div class="card">
+        <h3>Persistent investigation state</h3>
+        <p>Evidence, observations, entities, relationships, objectives, candidates, actions, outcomes, and hypotheses all live in one queryable model, not scattered across shell scrollback.</p>
+      </div>
+      <div class="card">
+        <h3>Explainable, human-executed</h3>
+        <p>Every suggested command carries its score terms and can be inspected with <code>why</code>. ExitOne stages the action — pressing Enter is always the operator's decision.</p>
+      </div>
+      <div class="card">
+        <h3>Cross-tool correlation</h3>
+        <p>Methodology triggers key off entity types and relationships, not hard-coded tool names, so evidence from any scanner feeds the same investigation graph.</p>
+      </div>
+      <div class="card">
+        <h3>LLM-narrated reporting</h3>
+        <p><code>exitone report</code> assembles scope, findings, credentials, and timeline from real data, with prose written by the local LLM in small, bounded, per-section calls.</p>
+      </div>
+      <div class="card">
+        <h3>Runs entirely local</h3>
+        <p>ExitOne manages its own local LLM sidecar (or an OpenAI-compatible endpoint you point it at) — no hosted AI provider is required.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <pre>git clone https://github.com/neavus-23/exitone.git
+cd exitone
+
+go build -o exitone ./cmd/exitone
+mkdir -p "$HOME/.local/bin"
+install -m 0755 exitone "$HOME/.local/bin/exitone"
+
+exitone start</pre>
+    <p style="color: var(--dim); margin-top: 14px;">
+      Requires Go 1.27+. Full requirements, the Control Console command map, and the TUI's
+      Overview/Graph/Vault/Chat views are documented in the
+      <a href="https://github.com/neavus-23/exitone#readme">project README</a>.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    ExitOne is intentionally human-in-the-loop. Use it only in environments you own or are explicitly authorized to test.
+    <br>
+    <a href="https://github.com/neavus-23/exitone">github.com/neavus-23/exitone</a> · MIT License
+  </div>
+</footer>
+
+</body>
+</html>

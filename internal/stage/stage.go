@@ -11,6 +11,8 @@ import (
 	"exitone/internal/store"
 )
 
+// Status es uno de los seis estados discretos que puede tener una etapa de
+// la investigación — nunca un porcentaje ni una probabilidad.
 type Status string
 
 const (
@@ -22,12 +24,19 @@ const (
 	Reopened   Status = "REOPENED"
 )
 
+// Stage es el estado calculado de una etapa de la investigación (discovery,
+// enumeration, validation, etc.) junto con la razón trazable a una consulta
+// real que llevó a asignarle ese Status.
 type Stage struct {
 	Name   string
 	Status Status
 	Reason string // por qué se asignó este estado — siempre trazable a una cuenta real
 }
 
+// Estimate calcula el estado de todas las etapas conocidas para una sesión,
+// en el orden fijo discovery → enumeration → analysis → hypotheses →
+// validation → exploitation_guidance → post_access → privilege_access →
+// objectives. Cada Stage.Reason cita el conteo real que la produjo.
 func Estimate(s *store.Store, sessionID string) ([]Stage, error) {
 	var stages []Stage
 

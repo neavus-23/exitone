@@ -7,15 +7,20 @@ package commandengine
 
 import "fmt"
 
+// Slot es un valor insertado en una plantilla de comando junto con su
+// provenance — nunca se pierde de dónde salió ese valor.
 type Slot struct {
 	Value      string
 	Provenance string // confirmed | inferred | user-provided
 }
 
+// Rendered es un comando ya armado a partir de un intent_key: el binario, la
+// línea completa lista para mostrarle al operador, y cada slot que la
+// compone con su provenance individual.
 type Rendered struct {
-	Tool      string
-	Command   string
-	Slots     map[string]Slot
+	Tool    string
+	Command string
+	Slots   map[string]Slot
 }
 
 // templates: intent_key -> (tool, plantilla con %s para {target}).

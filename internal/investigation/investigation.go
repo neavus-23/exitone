@@ -17,10 +17,10 @@ import (
 
 // IngestResult resume qué se creó, usado luego para medir Outcome (sección G2).
 type IngestResult struct {
-	EvidenceID    string
-	NewEntities   []string // entity IDs creados en esta ingesta
-	NewRelations  []string
-	OpenPorts     []parsers.OpenPort
+	EvidenceID   string
+	NewEntities  []string // entity IDs creados en esta ingesta
+	NewRelations []string
+	OpenPorts    []parsers.OpenPort
 }
 
 // IngestNmap registra la evidencia cruda, crea una Observation por puerto

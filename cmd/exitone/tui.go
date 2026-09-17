@@ -37,6 +37,7 @@ import (
 	"github.com/creack/pty"
 
 	credentialstore "exitone/internal/credential"
+	"exitone/internal/debuglog"
 	"exitone/internal/llm"
 	"exitone/internal/stage"
 	"exitone/internal/store"
@@ -409,7 +410,9 @@ func (m *tuiModel) startShell() tea.Cmd {
 		for {
 			n, err := m.emu.Read(buf)
 			if n > 0 {
-				m.ptmx.Write(buf[:n])
+				if _, werr := m.ptmx.Write(buf[:n]); werr != nil {
+					debuglog.LogError("tui_pty_echo_write", werr, nil)
+				}
 			}
 			if err != nil {
 				return
@@ -532,10 +535,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ptyOutputMsg:
 		if m.streamFile != nil {
-			m.streamFile.Write(msg)
+			if _, err := m.streamFile.Write(msg); err != nil {
+				debuglog.LogError("tui_stream_file_write", err, nil)
+			}
 		}
 		oldScrollback := m.terminalScrollbackLen()
-		m.emu.Write(msg)
+		if _, err := m.emu.Write(msg); err != nil {
+			debuglog.LogError("tui_emulator_write", err, nil)
+		}
 		// Si el operador está leyendo historia, mantener anclada la misma
 		// región aunque entren líneas nuevas. En 0 se sigue el fondo.
 		if m.termScroll > 0 {
@@ -754,12 +761,16 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// exactamente lo mismo que hacía el widget de zsh, pero ahora
 			// escribiendo directo al PTY en vez de manipular BUFFER de zle.
 			if suggestion := topSuggestion(m.s); suggestion != "" && m.ptmx != nil {
-				m.ptmx.Write([]byte(suggestion))
+				if _, err := m.ptmx.Write([]byte(suggestion)); err != nil {
+					debuglog.LogError("tui_pty_write_suggestion", err, nil)
+				}
 			}
 			return m, nil
 		default:
 			if m.ptmx != nil {
-				m.ptmx.Write(keyMsgToBytes(msg))
+				if _, err := m.ptmx.Write(keyMsgToBytes(msg)); err != nil {
+					debuglog.LogError("tui_pty_write_key", err, nil)
+				}
 			}
 			return m, nil
 		}

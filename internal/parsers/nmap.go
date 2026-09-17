@@ -13,16 +13,17 @@ import (
 
 // OpenPort es una observación determinista extraída de un escaneo nmap.
 type OpenPort struct {
-	Host     string
-	Port     int
-	Proto    string // tcp | udp
-	Service  string // ej. smb, ssh, http
-	Product  string // ej. "OpenSSH 8.9p1" si -sV lo reportó
+	Host    string
+	Port    int
+	Proto   string // tcp | udp
+	Service string // ej. smb, ssh, http
+	Product string // ej. "OpenSSH 8.9p1" si -sV lo reportó
 }
 
 // ParseNmapGreppable lee salida `nmap -oG -` y devuelve los puertos abiertos.
 // Formato de línea relevante:
-//   Host: 10.10.11.42 ()	Ports: 22/open/tcp//ssh//OpenSSH 8.9p1/, 445/open/tcp//microsoft-ds///
+//
+//	Host: 10.10.11.42 ()	Ports: 22/open/tcp//ssh//OpenSSH 8.9p1/, 445/open/tcp//microsoft-ds///
 func ParseNmapGreppable(r io.Reader) ([]OpenPort, error) {
 	var results []OpenPort
 	scanner := bufio.NewScanner(r)

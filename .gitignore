@@ -1,0 +1,26 @@
+# Compiled binaries
+/exitone
+/exitone.exe
+/bin/
+
+# Local runtime state — never commit an operator's investigation data.
+# A real credential/report leak has already happened once in this repo's
+# history from a scratch export sitting in the working tree; this exists so
+# it can't happen again by accident.
+.exitone/
+*.db
+*.db-shm
+*.db-wal
+nexus_report_*.md
+
+# Go build/test artifacts
+*.test
+*.out
+/coverage.txt
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

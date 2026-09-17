@@ -51,11 +51,11 @@ func (r ScanResult) Empty() bool {
 
 // Alias de campo reconocidos por los tres extractores (XML/JSON/tabla).
 var (
-	addressAliases  = []string{"address", "addr", "ip"}
-	portAliases     = []string{"port", "portid"}
-	protoAliases    = []string{"proto", "protocol"}
-	stateAliases    = []string{"state", "status"}
-	nameAliases     = []string{"name", "service", "servicename"}
+	addressAliases = []string{"address", "addr", "ip"}
+	portAliases    = []string{"port", "portid"}
+	protoAliases   = []string{"proto", "protocol"}
+	stateAliases   = []string{"state", "status"}
+	nameAliases    = []string{"name", "service", "servicename"}
 	// "name" cuenta como hostname solo en contexto de host (ver xml.go/json.go:
 	// nunca se evalúa dentro de un subárbol ya identificado como servicio).
 	hostnameAliases = []string{"hostname", "name"}
