@@ -126,6 +126,23 @@ func List(s *store.Store, sessionID string, reveal bool) ([]Credential, error) {
 	return out, rows.Err()
 }
 
+// Reveal devuelve un único secreto por ID exacto y sesión. La API separada
+// evita que una UI tenga que pedir List(..., true) y cargar accidentalmente
+// todas las credenciales en claro para revelar solo la seleccionada.
+func Reveal(s *store.Store, sessionID, credentialID string) (string, error) {
+	var value string
+	err := s.DB.QueryRow(`
+		SELECT secret_value FROM credential
+		WHERE session_id = ? AND id = ?`, sessionID, credentialID).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("credencial %q no encontrada", credentialID)
+	}
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
 func RecordAttempt(s *store.Store, sessionID, credentialRef, serviceRef, eventRef, result string) (string, error) {
 	if result != "success" && result != "fail" && result != "unknown" {
 		return "", fmt.Errorf("resultado debe ser success, fail o unknown")
@@ -165,13 +182,14 @@ func RecordAttempt(s *store.Store, sessionID, credentialRef, serviceRef, eventRe
 }
 
 func Mask(value string) string {
-	if value == "" {
+	runes := []rune(value)
+	if len(runes) == 0 {
 		return ""
 	}
-	if len(value) == 1 {
+	if len(runes) == 1 {
 		return "*"
 	}
-	return value[:1] + strings.Repeat("*", min(len(value)-1, 11))
+	return string(runes[0]) + strings.Repeat("*", min(len(runes)-1, 11))
 }
 
 func resolveCredential(s *store.Store, sessionID, ref string) (string, error) {

@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,11 +42,27 @@ import (
 	"exitone/internal/store"
 )
 
-const sidebarWidth = 42
+const (
+	defaultSplitRatio   = 0.50
+	minPaneContentWidth = 28
+	scrollStep          = 3
+	sidebarHeaderRows   = 2
+	maxChatInputRunes   = 2000
+	graphHeaderRows     = 3
+	maxGraphFilterRunes = 128
+	vaultHeaderRows     = 3
+	maxVaultFilterRunes = 128
+	vaultRevealDuration = 10 * time.Second
+	vaultArmDuration    = 5 * time.Second
+)
 
 type ptyOutputMsg []byte
 type ptyClosedMsg struct{}
 type dashboardTickMsg time.Time
+type vaultRevealExpiredMsg struct {
+	credentialID string
+	until        time.Time
+}
 
 // narrationMsg es la respuesta asíncrona de narrateCmd — candidateID identifica
 // PARA QUÉ candidato se pidió, así Update() puede descartarla si para cuando
@@ -56,24 +74,86 @@ type narrationMsg struct {
 	err         error
 }
 
-// chatAnswerMsg es la respuesta asíncrona de askCmd — se busca por texto de
-// la pregunta en chatHistory porque solo puede haber una pregunta pendiente
-// a la vez (chatAsking bloquea el envío de una segunda mientras la primera
-// no respondió).
+// chatAnswerMsg vuelve con un ID monotónico. El texto no sirve como clave:
+// un operador puede repetir exactamente la misma pregunta o reintentarla.
 type chatAnswerMsg struct {
-	question string
-	answer   string
-	err      error
+	requestID uint64
+	answer    string
+	err       error
 }
 
 type chatTurn struct {
-	question string
-	answer   string
-	err      error
+	id        uint64
+	question  string
+	answer    string
+	err       error
+	startedAt time.Time
+	elapsed   time.Duration
 }
 
-// sidebarMode — el panel lateral es angosto (sidebarWidth), así que en vez
-// de amontonar todo, se cicla entre vistas enfocadas con F2 (idea tomada
+type graphRow struct {
+	entityID   string
+	parentID   string
+	entityType string
+	value      string
+	attrs      string
+	relation   string
+	confidence float64
+	depth      int
+	children   int
+	incoming   int
+	outgoing   int
+	expanded   bool
+	crossLink  bool
+}
+
+type vaultRowKind int
+
+const (
+	vaultIdentityRow vaultRowKind = iota
+	vaultCredentialRow
+)
+
+type vaultRow struct {
+	kind         vaultRowKind
+	key          string
+	parentKey    string
+	identityID   string
+	credentialID string
+	identity     string
+	service      string
+	maskedValue  string
+	status       string
+	source       string
+	provenance   string
+	createdAt    string
+	lastResult   string
+	lastAttempt  string
+	attempts     int
+	successes    int
+	failures     int
+	children     int
+	expanded     bool
+}
+
+type paneFocus int
+
+const (
+	focusTerminal paneFocus = iota
+	focusSidebar
+)
+
+type dragTarget int
+
+const (
+	dragNone dragTarget = iota
+	dragDivider
+	dragTerminalScrollbar
+	dragSidebarScrollbar
+)
+
+// sidebarMode — para no amontonar señales distintas, se cicla entre vistas
+// enfocadas con F2 (idea tomada
 // de RedAmon: un grafo del attack surface en vez de solo listas planas; de
 // Pentest Copilot: una vista dedicada de identidades/credenciales en vez de
 // mezclarlas con el resto de entidades; y un modo de chat embebido, mismo
@@ -139,7 +219,13 @@ type tuiModel struct {
 	height     int
 	termWidth  int
 	termHeight int
+	sideWidth  int
 	sidebar    string
+	splitRatio float64
+	termScroll int // líneas desde el fondo; 0 sigue la salida en vivo
+	sideScroll [sidebarModeCount]int
+	focus      paneFocus
+	dragging   dragTarget
 	quitting   bool
 	paused     bool        // Ctrl+P (tomado de PentestGPT): congela el refresco del panel
 	showHelp   bool        // F1 (tomado de PentestGPT): overlay de ayuda contextual
@@ -161,7 +247,36 @@ type tuiModel struct {
 	// teclado deja de ir a la pty y va acá (ver handleChatKey).
 	chatHistory []chatTurn
 	chatInput   string
+	chatCursor  int // índice de runa, no byte
 	chatAsking  bool
+	chatNextID  uint64
+	chatActive  uint64
+	chatCancel  context.CancelFunc
+	chatRecall  int
+	chatDraft   string
+
+	// Graph explorer: la selección se conserva por fila visible y el mapa de
+	// colapso por entity ID. El filtro es local al pane y nunca modifica el
+	// Investigation Model persistido.
+	graphRows         []graphRow
+	graphCursor       int
+	graphCollapsed    map[string]bool
+	graphFilter       string
+	graphFilterCursor int
+	graphFiltering    bool
+
+	vaultRows         []vaultRow
+	vaultCursor       int
+	vaultCollapsed    map[string]bool
+	vaultFilter       string
+	vaultFilterCursor int
+	vaultFiltering    bool
+	vaultRevealID     string
+	vaultRevealValue  string
+	vaultRevealUntil  time.Time
+	vaultRevealArmed  string
+	vaultArmUntil     time.Time
+	vaultError        string
 }
 
 // newTUIModel decide, ANTES de dibujar nada, si hace falta onboarding:
@@ -170,7 +285,10 @@ type tuiModel struct {
 // nada que listar), exactamente 1 se resume solo sin mostrar ninguna
 // pantalla, y solo con 2+ aparece el selector.
 func newTUIModel(s *store.Store) *tuiModel {
-	m := &tuiModel{s: s, phase: phaseRunning}
+	m := &tuiModel{
+		s: s, phase: phaseRunning, splitRatio: defaultSplitRatio, focus: focusTerminal,
+		chatRecall: -1, graphCollapsed: make(map[string]bool), vaultCollapsed: make(map[string]bool),
+	}
 	if _, ok := currentSessionID(s); ok {
 		return m
 	}
@@ -365,19 +483,18 @@ func narrateCmd(s *store.Store, sessionID, candidateID string) tea.Cmd {
 	}
 }
 
-// askCmd es el equivalente para el chat embebido: mismo `llm.Ask` que usa
-// `exitone ask`, mismo patrón de goroutine-propia-vía-tea.Cmd que narrateCmd.
-func askCmd(s *store.Store, sessionID, question string) tea.Cmd {
+// askCmd es el equivalente para el chat embebido. Recibe el contexto ya
+// cancelable y una cola corta de conversación para resolver follow-ups sin
+// convertir el historial del chat en evidencia de la investigación.
+func askCmd(ctx context.Context, s *store.Store, sessionID string, requestID uint64, conversation, question string) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
 		summary, err := llm.BuildContextSummary(s, sessionID)
 		if err != nil {
-			return chatAnswerMsg{question: question, err: err}
+			return chatAnswerMsg{requestID: requestID, err: err}
 		}
 		client := llm.New()
-		answer, err := llm.Ask(ctx, client, s, sessionID, summary, question)
-		return chatAnswerMsg{question: question, answer: answer, err: err}
+		answer, err := llm.AskWithConversation(ctx, client, s, sessionID, summary, conversation, question)
+		return chatAnswerMsg{requestID: requestID, answer: answer, err: err}
 	}
 }
 
@@ -386,17 +503,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		// Cada pane ahora tiene su propio borde (ver renderTitledBox en
-		// View()): 2 columnas (izq+der) y 2 filas (arriba+abajo) de borde
-		// por pane, más 1 columna de separación entre ambos y 1 fila para
-		// la status-line inferior. Sin restar exactamente esto, el
-		// contenido reportado a la pty no coincide con el espacio real
-		// donde se renderiza — mismo bug de fondo ya documentado más abajo
-		// en View() (desalineación de tamaños entre bloques).
-		m.termWidth = m.width - sidebarWidth - 5
-		if m.termWidth < 20 {
-			m.termWidth = 20
-		}
+		// Siete columnas no pertenecen al contenido: dos bordes por pane,
+		// una scrollbar por pane y el divisor arrastrable central.
+		m.applySplit()
 		m.termHeight = m.height - 3
 		if m.termHeight < 5 {
 			m.termHeight = 5
@@ -425,7 +534,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.streamFile != nil {
 			m.streamFile.Write(msg)
 		}
+		oldScrollback := m.terminalScrollbackLen()
 		m.emu.Write(msg)
+		// Si el operador está leyendo historia, mantener anclada la misma
+		// región aunque entren líneas nuevas. En 0 se sigue el fondo.
+		if m.termScroll > 0 {
+			m.termScroll += m.terminalScrollbackLen() - oldScrollback
+		}
+		m.clampScrolls()
 		return m, waitForPtyOutput(m.ptmx)
 
 	case ptyClosedMsg:
@@ -434,6 +550,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.streamFile != nil {
 			m.streamFile.Close()
 		}
+		if m.chatCancel != nil {
+			m.chatCancel()
+		}
+		m.clearVaultReveal()
 		m.quitting = true
 		return m, tea.Quit
 
@@ -445,6 +565,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tickDashboard())
 		if !m.paused && m.phase == phaseRunning {
 			m.sidebar = renderSidebar(m)
+			m.clampScrolls()
 
 			// La narración se dispara SOLO cuando el candidato top cambió
 			// de verdad — nunca en cada tick de 2s (eso sería spamear al
@@ -481,22 +602,48 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.finishOnboarding()
 			}
 			m.sidebar = renderSidebar(m)
+			m.clampScrolls()
 		}
 		return m, nil
 
 	case chatAnswerMsg:
+		// Una respuesta cancelada puede llegar después de que ya arrancó otro
+		// request. El ID evita que cierre o sobrescriba el turno nuevo.
+		if msg.requestID != m.chatActive {
+			return m, nil
+		}
+		if m.chatCancel != nil {
+			m.chatCancel()
+			m.chatCancel = nil
+		}
 		for i := range m.chatHistory {
-			if m.chatHistory[i].question == msg.question && m.chatHistory[i].answer == "" && m.chatHistory[i].err == nil {
+			if m.chatHistory[i].id == msg.requestID {
+				m.chatHistory[i].elapsed = time.Since(m.chatHistory[i].startedAt)
 				if msg.err != nil {
 					m.chatHistory[i].err = msg.err
 				} else {
-					m.chatHistory[i].answer = msg.answer
+					m.chatHistory[i].answer = strings.TrimSpace(msg.answer)
 				}
 				break
 			}
 		}
 		m.chatAsking = false
+		m.chatActive = 0
 		m.sidebar = renderSidebar(m)
+		m.scrollSidebarToEnd()
+		return m, nil
+
+	case vaultRevealExpiredMsg:
+		if m.vaultRevealID == msg.credentialID && m.vaultRevealUntil.Equal(msg.until) {
+			m.clearVaultReveal()
+			m.sidebar = renderSidebar(m)
+		}
+		return m, nil
+
+	case tea.MouseMsg:
+		if m.phase == phaseRunning {
+			m.handleMouse(tea.MouseEvent(msg))
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -515,6 +662,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "f1":
 			// F1 (tomado de PentestGPT): ayuda contextual, sin salir de la TUI.
+			if m.mode == sidebarVault {
+				m.clearVaultReveal()
+			}
 			m.showHelp = true
 			return m, nil
 		case "ctrl+p":
@@ -527,8 +677,45 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Cicla Overview/Graph/Vault/Chat. Deliberadamente NO es Tab:
 			// Tab lo necesita el shell embebido para autocompletar rutas/
 			// comandos — robárselo habría roto el uso normal de la terminal.
+			if m.mode == sidebarVault {
+				m.clearVaultReveal()
+			}
 			m.mode = (m.mode + 1) % sidebarModeCount
+			if m.mode == sidebarGraph || m.mode == sidebarVault || m.mode == sidebarChat {
+				m.focus = focusSidebar
+			} else {
+				m.focus = focusTerminal
+			}
 			m.sidebar = renderSidebar(m)
+			m.clampScrolls()
+			return m, nil
+		case "f3":
+			if m.focus == focusTerminal {
+				m.focus = focusSidebar
+			} else {
+				if m.mode == sidebarVault {
+					m.clearVaultReveal()
+				}
+				m.focus = focusTerminal
+			}
+			return m, nil
+		case "alt+left":
+			m.setSideWidth(m.sideWidth + 2)
+			return m, nil
+		case "alt+right":
+			m.setSideWidth(m.sideWidth - 2)
+			return m, nil
+		case "pgup", "shift+up":
+			m.scrollFocused(max(1, m.sidebarViewportHeight()/2))
+			return m, nil
+		case "pgdown", "shift+down":
+			m.scrollFocused(-max(1, m.sidebarViewportHeight()/2))
+			return m, nil
+		case "ctrl+home":
+			m.scrollFocusedToStart()
+			return m, nil
+		case "ctrl+end":
+			m.scrollFocusedToEnd()
 			return m, nil
 		case "ctrl+q":
 			// Salida explícita de la TUI SIN matar el shell embebido de forma
@@ -539,6 +726,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.streamFile != nil {
 				m.streamFile.Close()
 			}
+			if m.chatCancel != nil {
+				m.chatCancel()
+			}
+			m.clearVaultReveal()
 			m.quitting = true
 			return m, tea.Quit
 		}
@@ -546,8 +737,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Foco en el chat: el teclado deja de ir a la pty y va al cuadro de
 		// texto del asistente — único cambio real de enrutamiento de
 		// teclado de todo este panel (ver handleChatKey).
-		if m.mode == sidebarChat {
+		if m.mode == sidebarChat && m.focus == focusSidebar {
 			return m.handleChatKey(msg)
+		}
+		if m.mode == sidebarGraph && m.focus == focusSidebar {
+			return m.handleGraphKey(msg)
+		}
+		if m.mode == sidebarVault && m.focus == focusSidebar {
+			return m.handleVaultKey(msg)
 		}
 
 		switch msg.String() {
@@ -570,45 +767,612 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleChatKey enruta el teclado al cuadro de texto del asistente en vez de
-// a la pty — solo se llama cuando m.mode == sidebarChat (ver Update).
+// handleChatKey ofrece edición de línea familiar para un operador de
+// terminal. El historial y los requests viven solo en memoria; ninguna
+// tecla de chat llega accidentalmente al PTY.
 func (m *tuiModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		// Vuelve el foco a la terminal sin salir de la TUI.
-		m.mode = sidebarOverview
+		// Mantiene el chat visible: Esc solo devuelve el teclado a la terminal.
+		m.focus = focusTerminal
+		return m, nil
+	case "enter", "ctrl+enter":
+		return m.submitChatQuestion(strings.TrimSpace(m.chatInput))
+	case "ctrl+c":
+		if m.chatAsking {
+			m.cancelChatRequest()
+		} else {
+			m.setChatInput("")
+		}
 		m.sidebar = renderSidebar(m)
 		return m, nil
-	case "enter":
-		question := strings.TrimSpace(m.chatInput)
-		if question == "" || m.chatAsking {
+	case "ctrl+r":
+		if m.chatAsking {
 			return m, nil
 		}
-		sessionID, ok := currentSessionID(m.s)
-		if !ok {
-			m.chatHistory = append(m.chatHistory, chatTurn{question: question, err: fmt.Errorf("sin sesión activa")})
-			m.chatInput = ""
+		for i := len(m.chatHistory) - 1; i >= 0; i-- {
+			if m.chatHistory[i].err != nil {
+				return m.submitChatQuestion(m.chatHistory[i].question)
+			}
+		}
+		return m, nil
+	case "ctrl+l":
+		if !m.chatAsking {
+			m.chatHistory = nil
+			m.sideScroll[sidebarChat] = 0
 			m.sidebar = renderSidebar(m)
-			return m, nil
 		}
-		m.chatHistory = append(m.chatHistory, chatTurn{question: question})
-		m.chatInput = ""
-		m.chatAsking = true
+		return m, nil
+	case "ctrl+u":
+		m.setChatInput("")
 		m.sidebar = renderSidebar(m)
-		return m, askCmd(m.s, sessionID, question)
+		return m, nil
+	case "ctrl+w":
+		m.deleteChatWord()
+		m.sidebar = renderSidebar(m)
+		return m, nil
+	case "left":
+		m.chatCursor = max(0, m.chatCursor-1)
+		return m, nil
+	case "right":
+		m.chatCursor = min(len([]rune(m.chatInput)), m.chatCursor+1)
+		return m, nil
+	case "home", "ctrl+a":
+		m.chatCursor = 0
+		return m, nil
+	case "end", "ctrl+e":
+		m.chatCursor = len([]rune(m.chatInput))
+		return m, nil
+	case "up":
+		m.recallChatQuestion(-1)
+		m.sidebar = renderSidebar(m)
+		return m, nil
+	case "down":
+		m.recallChatQuestion(1)
+		m.sidebar = renderSidebar(m)
+		return m, nil
 	case "backspace":
-		if r := []rune(m.chatInput); len(r) > 0 {
-			m.chatInput = string(r[:len(r)-1])
+		runes := []rune(m.chatInput)
+		if m.chatCursor > 0 && m.chatCursor <= len(runes) {
+			runes = append(runes[:m.chatCursor-1], runes[m.chatCursor:]...)
+			m.chatCursor--
+			m.chatInput = string(runes)
 		}
+		m.resetChatRecall()
+		m.sidebar = renderSidebar(m)
+		return m, nil
+	case "delete":
+		runes := []rune(m.chatInput)
+		if m.chatCursor >= 0 && m.chatCursor < len(runes) {
+			runes = append(runes[:m.chatCursor], runes[m.chatCursor+1:]...)
+			m.chatInput = string(runes)
+		}
+		m.resetChatRecall()
 		m.sidebar = renderSidebar(m)
 		return m, nil
 	default:
 		if len(msg.Runes) > 0 {
-			m.chatInput += string(msg.Runes)
+			runes := []rune(m.chatInput)
+			cursor := clamp(m.chatCursor, 0, len(runes))
+			room := max(0, maxChatInputRunes-len(runes))
+			insert := msg.Runes[:min(len(msg.Runes), room)]
+			updated := make([]rune, 0, len(runes)+len(insert))
+			updated = append(updated, runes[:cursor]...)
+			updated = append(updated, insert...)
+			updated = append(updated, runes[cursor:]...)
+			m.chatInput = string(updated)
+			m.chatCursor = cursor + len(insert)
+			m.resetChatRecall()
 			m.sidebar = renderSidebar(m)
 		}
 		return m, nil
 	}
+}
+
+func (m *tuiModel) submitChatQuestion(question string) (tea.Model, tea.Cmd) {
+	if question == "" || m.chatAsking {
+		return m, nil
+	}
+	m.chatNextID++
+	id := m.chatNextID
+	started := time.Now()
+	sessionID, ok := currentSessionID(m.s)
+	if !ok {
+		m.chatHistory = append(m.chatHistory, chatTurn{
+			id: id, question: question, err: fmt.Errorf("sin sesión activa"), startedAt: started,
+		})
+		m.setChatInput("")
+		m.sidebar = renderSidebar(m)
+		m.scrollSidebarToEnd()
+		return m, nil
+	}
+
+	conversation := recentChatContext(m.chatHistory, 3, 2400)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	m.chatCancel = cancel
+	m.chatActive = id
+	m.chatAsking = true
+	m.chatHistory = append(m.chatHistory, chatTurn{id: id, question: question, startedAt: started})
+	m.setChatInput("")
+	m.sidebar = renderSidebar(m)
+	m.scrollSidebarToEnd()
+	return m, askCmd(ctx, m.s, sessionID, id, conversation, question)
+}
+
+func (m *tuiModel) cancelChatRequest() {
+	if !m.chatAsking {
+		return
+	}
+	if m.chatCancel != nil {
+		m.chatCancel()
+	}
+	for i := range m.chatHistory {
+		if m.chatHistory[i].id == m.chatActive {
+			m.chatHistory[i].err = fmt.Errorf("consulta cancelada")
+			m.chatHistory[i].elapsed = time.Since(m.chatHistory[i].startedAt)
+			break
+		}
+	}
+	m.chatCancel = nil
+	m.chatActive = 0
+	m.chatAsking = false
+}
+
+func (m *tuiModel) setChatInput(value string) {
+	runes := []rune(value)
+	if len(runes) > maxChatInputRunes {
+		runes = runes[:maxChatInputRunes]
+	}
+	m.chatInput = string(runes)
+	m.chatCursor = len(runes)
+	m.resetChatRecall()
+}
+
+func (m *tuiModel) resetChatRecall() {
+	m.chatRecall = -1
+	m.chatDraft = ""
+}
+
+func (m *tuiModel) recallChatQuestion(direction int) {
+	if len(m.chatHistory) == 0 {
+		return
+	}
+	if m.chatRecall < 0 {
+		if direction > 0 {
+			return
+		}
+		m.chatDraft = m.chatInput
+		m.chatRecall = len(m.chatHistory) - 1
+	} else {
+		m.chatRecall += direction
+	}
+	if m.chatRecall < 0 {
+		m.chatRecall = 0
+	}
+	if m.chatRecall >= len(m.chatHistory) {
+		m.chatRecall = -1
+		m.chatInput = m.chatDraft
+		m.chatDraft = ""
+		m.chatCursor = len([]rune(m.chatInput))
+		return
+	}
+	m.chatInput = m.chatHistory[m.chatRecall].question
+	m.chatCursor = len([]rune(m.chatInput))
+}
+
+func (m *tuiModel) deleteChatWord() {
+	runes := []rune(m.chatInput)
+	cursor := clamp(m.chatCursor, 0, len(runes))
+	start := cursor
+	for start > 0 && runes[start-1] == ' ' {
+		start--
+	}
+	for start > 0 && runes[start-1] != ' ' {
+		start--
+	}
+	m.chatInput = string(append(runes[:start], runes[cursor:]...))
+	m.chatCursor = start
+	m.resetChatRecall()
+}
+
+func recentChatContext(history []chatTurn, maxTurns, maxChars int) string {
+	if maxTurns < 1 || maxChars < 1 {
+		return ""
+	}
+	var turns []string
+	for i := len(history) - 1; i >= 0 && len(turns) < maxTurns; i-- {
+		if history[i].answer == "" || history[i].err != nil {
+			continue
+		}
+		turns = append([]string{fmt.Sprintf("OPERADOR: %s\nEXITONE: %s", history[i].question, history[i].answer)}, turns...)
+	}
+	context := strings.Join(turns, "\n\n")
+	runes := []rune(context)
+	if len(runes) > maxChars {
+		context = "…" + string(runes[len(runes)-maxChars+1:])
+	}
+	return context
+}
+
+func (m *tuiModel) handleGraphKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.graphFiltering {
+		switch msg.String() {
+		case "esc":
+			m.graphFiltering = false
+		case "enter":
+			m.graphFiltering = false
+		case "ctrl+u":
+			m.graphFilter = ""
+			m.graphFilterCursor = 0
+		case "left":
+			m.graphFilterCursor = max(0, m.graphFilterCursor-1)
+		case "right":
+			m.graphFilterCursor = min(len([]rune(m.graphFilter)), m.graphFilterCursor+1)
+		case "home", "ctrl+a":
+			m.graphFilterCursor = 0
+		case "end", "ctrl+e":
+			m.graphFilterCursor = len([]rune(m.graphFilter))
+		case "backspace":
+			runes := []rune(m.graphFilter)
+			if m.graphFilterCursor > 0 && m.graphFilterCursor <= len(runes) {
+				runes = append(runes[:m.graphFilterCursor-1], runes[m.graphFilterCursor:]...)
+				m.graphFilterCursor--
+				m.graphFilter = string(runes)
+			}
+		case "delete":
+			runes := []rune(m.graphFilter)
+			if m.graphFilterCursor >= 0 && m.graphFilterCursor < len(runes) {
+				runes = append(runes[:m.graphFilterCursor], runes[m.graphFilterCursor+1:]...)
+				m.graphFilter = string(runes)
+			}
+		default:
+			if len(msg.Runes) > 0 {
+				runes := []rune(m.graphFilter)
+				room := max(0, maxGraphFilterRunes-len(runes))
+				insert := msg.Runes[:min(room, len(msg.Runes))]
+				cursor := clamp(m.graphFilterCursor, 0, len(runes))
+				updated := make([]rune, 0, len(runes)+len(insert))
+				updated = append(updated, runes[:cursor]...)
+				updated = append(updated, insert...)
+				updated = append(updated, runes[cursor:]...)
+				m.graphFilter = string(updated)
+				m.graphFilterCursor = cursor + len(insert)
+			}
+		}
+		m.refreshGraph(true)
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "esc":
+		m.focus = focusTerminal
+		return m, nil
+	case "/":
+		m.graphFiltering = true
+		m.graphFilterCursor = len([]rune(m.graphFilter))
+		return m, nil
+	case "c":
+		m.graphFilter = ""
+		m.graphFilterCursor = 0
+		m.refreshGraph(true)
+	case "r":
+		m.graphFilter = ""
+		m.graphFilterCursor = 0
+		m.graphCollapsed = make(map[string]bool)
+		m.refreshGraph(true)
+	case "up", "k":
+		m.graphCursor = max(0, m.graphCursor-1)
+		m.ensureGraphCursorVisible()
+		m.sidebar = renderSidebar(m)
+	case "down", "j":
+		m.graphCursor = min(max(0, len(m.graphRows)-1), m.graphCursor+1)
+		m.ensureGraphCursorVisible()
+		m.sidebar = renderSidebar(m)
+	case "home", "g":
+		m.graphCursor = 0
+		m.ensureGraphCursorVisible()
+		m.sidebar = renderSidebar(m)
+	case "end", "G":
+		m.graphCursor = max(0, len(m.graphRows)-1)
+		m.ensureGraphCursorVisible()
+		m.sidebar = renderSidebar(m)
+	case "left", "h":
+		if row, ok := m.selectedGraphRow(); ok {
+			if row.children > 0 && row.expanded {
+				m.graphCollapsed[row.entityID] = true
+				m.refreshGraph(true)
+			} else if row.parentID != "" {
+				m.selectGraphEntity(row.parentID)
+			}
+		}
+	case "right", "l":
+		if row, ok := m.selectedGraphRow(); ok && row.children > 0 && !row.expanded {
+			delete(m.graphCollapsed, row.entityID)
+			m.refreshGraph(true)
+		}
+	case "enter", "space":
+		if row, ok := m.selectedGraphRow(); ok && row.children > 0 {
+			if row.expanded {
+				m.graphCollapsed[row.entityID] = true
+			} else {
+				delete(m.graphCollapsed, row.entityID)
+			}
+			m.refreshGraph(true)
+		}
+	}
+	return m, nil
+}
+
+func (m *tuiModel) selectedGraphRow() (graphRow, bool) {
+	if m.graphCursor < 0 || m.graphCursor >= len(m.graphRows) {
+		return graphRow{}, false
+	}
+	return m.graphRows[m.graphCursor], true
+}
+
+func (m *tuiModel) selectGraphEntity(entityID string) {
+	for i := range m.graphRows {
+		if m.graphRows[i].entityID == entityID && !m.graphRows[i].crossLink {
+			m.graphCursor = i
+			m.ensureGraphCursorVisible()
+			m.sidebar = renderSidebar(m)
+			return
+		}
+	}
+}
+
+func (m *tuiModel) refreshGraph(reveal bool) {
+	m.sidebar = renderSidebar(m)
+	if reveal {
+		m.ensureGraphCursorVisible()
+	}
+}
+
+func (m *tuiModel) ensureGraphCursorVisible() {
+	if len(m.graphRows) == 0 {
+		m.sideScroll[sidebarGraph] = 0
+		return
+	}
+	m.graphCursor = clamp(m.graphCursor, 0, len(m.graphRows)-1)
+	docLine := graphHeaderRows + m.graphCursor
+	height := m.sidebarViewportHeight()
+	top := m.sideScroll[sidebarGraph]
+	if docLine < top {
+		top = docLine
+	} else if height > 0 && docLine >= top+height {
+		top = docLine - height + 1
+	}
+	m.sideScroll[sidebarGraph] = max(0, top)
+}
+
+func (m *tuiModel) handleVaultKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.expireVaultReveal()
+	if m.vaultFiltering {
+		switch msg.String() {
+		case "esc", "enter":
+			m.vaultFiltering = false
+		case "ctrl+u":
+			m.vaultFilter = ""
+			m.vaultFilterCursor = 0
+		case "left":
+			m.vaultFilterCursor = max(0, m.vaultFilterCursor-1)
+		case "right":
+			m.vaultFilterCursor = min(len([]rune(m.vaultFilter)), m.vaultFilterCursor+1)
+		case "home", "ctrl+a":
+			m.vaultFilterCursor = 0
+		case "end", "ctrl+e":
+			m.vaultFilterCursor = len([]rune(m.vaultFilter))
+		case "backspace":
+			runes := []rune(m.vaultFilter)
+			if m.vaultFilterCursor > 0 && m.vaultFilterCursor <= len(runes) {
+				runes = append(runes[:m.vaultFilterCursor-1], runes[m.vaultFilterCursor:]...)
+				m.vaultFilterCursor--
+				m.vaultFilter = string(runes)
+			}
+		case "delete":
+			runes := []rune(m.vaultFilter)
+			if m.vaultFilterCursor >= 0 && m.vaultFilterCursor < len(runes) {
+				runes = append(runes[:m.vaultFilterCursor], runes[m.vaultFilterCursor+1:]...)
+				m.vaultFilter = string(runes)
+			}
+		default:
+			if len(msg.Runes) > 0 {
+				runes := []rune(m.vaultFilter)
+				room := max(0, maxVaultFilterRunes-len(runes))
+				insert := msg.Runes[:min(room, len(msg.Runes))]
+				cursor := clamp(m.vaultFilterCursor, 0, len(runes))
+				updated := make([]rune, 0, len(runes)+len(insert))
+				updated = append(updated, runes[:cursor]...)
+				updated = append(updated, insert...)
+				updated = append(updated, runes[cursor:]...)
+				m.vaultFilter = string(updated)
+				m.vaultFilterCursor = cursor + len(insert)
+			}
+		}
+		m.clearVaultReveal()
+		m.refreshVault(true)
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "esc":
+		m.clearVaultReveal()
+		m.focus = focusTerminal
+	case "/":
+		m.clearVaultReveal()
+		m.vaultFiltering = true
+		m.vaultFilterCursor = len([]rune(m.vaultFilter))
+	case "c":
+		m.clearVaultReveal()
+		m.vaultFilter = ""
+		m.vaultFilterCursor = 0
+		m.refreshVault(true)
+	case "r":
+		m.clearVaultReveal()
+		m.vaultFilter = ""
+		m.vaultFilterCursor = 0
+		m.vaultCollapsed = make(map[string]bool)
+		m.vaultError = ""
+		m.refreshVault(true)
+	case "up", "k":
+		m.moveVaultCursor(-1)
+	case "down", "j":
+		m.moveVaultCursor(1)
+	case "home", "g":
+		m.clearVaultReveal()
+		m.vaultCursor = 0
+		m.ensureVaultCursorVisible()
+		m.sidebar = renderSidebar(m)
+	case "end", "G":
+		m.clearVaultReveal()
+		m.vaultCursor = max(0, len(m.vaultRows)-1)
+		m.ensureVaultCursorVisible()
+		m.sidebar = renderSidebar(m)
+	case "left", "h":
+		if row, ok := m.selectedVaultRow(); ok {
+			m.clearVaultReveal()
+			if row.kind == vaultIdentityRow && row.children > 0 && row.expanded {
+				m.vaultCollapsed[row.key] = true
+				m.refreshVault(true)
+			} else if row.parentKey != "" {
+				m.selectVaultKey(row.parentKey)
+			}
+		}
+	case "right", "l":
+		if row, ok := m.selectedVaultRow(); ok && row.kind == vaultIdentityRow && row.children > 0 && !row.expanded {
+			m.clearVaultReveal()
+			delete(m.vaultCollapsed, row.key)
+			m.refreshVault(true)
+		}
+	case "enter", "space":
+		if row, ok := m.selectedVaultRow(); ok && row.kind == vaultIdentityRow && row.children > 0 {
+			m.clearVaultReveal()
+			if row.expanded {
+				m.vaultCollapsed[row.key] = true
+			} else {
+				delete(m.vaultCollapsed, row.key)
+			}
+			m.refreshVault(true)
+		}
+	case "v":
+		cmd := m.toggleVaultReveal()
+		m.sidebar = renderSidebar(m)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m *tuiModel) moveVaultCursor(delta int) {
+	if len(m.vaultRows) == 0 {
+		return
+	}
+	m.clearVaultReveal()
+	m.vaultCursor = clamp(m.vaultCursor+delta, 0, len(m.vaultRows)-1)
+	m.ensureVaultCursorVisible()
+	m.sidebar = renderSidebar(m)
+}
+
+func (m *tuiModel) selectedVaultRow() (vaultRow, bool) {
+	if m.vaultCursor < 0 || m.vaultCursor >= len(m.vaultRows) {
+		return vaultRow{}, false
+	}
+	return m.vaultRows[m.vaultCursor], true
+}
+
+func (m *tuiModel) selectVaultKey(key string) {
+	for i := range m.vaultRows {
+		if m.vaultRows[i].key == key {
+			m.vaultCursor = i
+			m.ensureVaultCursorVisible()
+			m.sidebar = renderSidebar(m)
+			return
+		}
+	}
+}
+
+func (m *tuiModel) refreshVault(reveal bool) {
+	m.sidebar = renderSidebar(m)
+	if reveal {
+		m.ensureVaultCursorVisible()
+	}
+}
+
+func (m *tuiModel) ensureVaultCursorVisible() {
+	if len(m.vaultRows) == 0 {
+		m.sideScroll[sidebarVault] = 0
+		return
+	}
+	m.vaultCursor = clamp(m.vaultCursor, 0, len(m.vaultRows)-1)
+	docLine := vaultHeaderRows + m.vaultCursor
+	height := m.sidebarViewportHeight()
+	top := m.sideScroll[sidebarVault]
+	if docLine < top {
+		top = docLine
+	} else if height > 0 && docLine >= top+height {
+		top = docLine - height + 1
+	}
+	m.sideScroll[sidebarVault] = max(0, top)
+}
+
+func (m *tuiModel) toggleVaultReveal() tea.Cmd {
+	row, ok := m.selectedVaultRow()
+	if !ok || row.kind != vaultCredentialRow {
+		return nil
+	}
+	now := time.Now()
+	if m.vaultRevealID == row.credentialID && now.Before(m.vaultRevealUntil) {
+		m.clearVaultReveal()
+		return nil
+	}
+	if m.vaultRevealArmed != row.credentialID || now.After(m.vaultArmUntil) {
+		m.clearVaultReveal()
+		m.vaultRevealArmed = row.credentialID
+		m.vaultArmUntil = now.Add(vaultArmDuration)
+		return nil
+	}
+	sessionID, ok := currentSessionID(m.s)
+	if !ok {
+		m.clearVaultReveal()
+		m.vaultError = "no active session"
+		return nil
+	}
+	value, err := credentialstore.Reveal(m.s, sessionID, row.credentialID)
+	if err != nil {
+		m.clearVaultReveal()
+		m.vaultError = err.Error()
+		return nil
+	}
+	m.vaultRevealArmed = ""
+	m.vaultArmUntil = time.Time{}
+	m.vaultRevealID = row.credentialID
+	m.vaultRevealValue = value
+	m.vaultRevealUntil = now.Add(vaultRevealDuration)
+	m.vaultError = ""
+	credentialID := row.credentialID
+	until := m.vaultRevealUntil
+	return tea.Tick(vaultRevealDuration, func(time.Time) tea.Msg {
+		return vaultRevealExpiredMsg{credentialID: credentialID, until: until}
+	})
+}
+
+func (m *tuiModel) expireVaultReveal() {
+	now := time.Now()
+	if m.vaultRevealID != "" && !m.vaultRevealUntil.IsZero() && !now.Before(m.vaultRevealUntil) {
+		m.clearVaultReveal()
+	}
+	if m.vaultRevealArmed != "" && !m.vaultArmUntil.IsZero() && !now.Before(m.vaultArmUntil) {
+		m.vaultRevealArmed = ""
+		m.vaultArmUntil = time.Time{}
+	}
+}
+
+func (m *tuiModel) clearVaultReveal() {
+	m.vaultRevealID = ""
+	m.vaultRevealValue = ""
+	m.vaultRevealUntil = time.Time{}
+	m.vaultRevealArmed = ""
+	m.vaultArmUntil = time.Time{}
+	m.vaultError = ""
 }
 
 // handleOnboardingKey enruta el teclado mientras m.phase == phaseOnboarding
@@ -692,7 +1456,7 @@ func (m *tuiModel) submitOnboarding() (tea.Model, tea.Cmd) {
 	return m.enterPreparing()
 }
 
-// enterPreparing dispara la MISMA narración que después se ve en GUÍA (ver
+// enterPreparing dispara la MISMA narración que después se ve en WHY / RISK (ver
 // narrateCmd) para usarla como bienvenida — nunca una segunda llamada LLM
 // redundante. Si no hay ningún candidato que narrar todavía (workspace
 // recién creado sin bootstrap, o el LLM local no está disponible), pasa
@@ -811,34 +1575,17 @@ func (m *tuiModel) View() string {
 		return "iniciando..."
 	}
 
-	// emu.Render() NO rellena cada línea hasta el ancho completo (recorta
-	// espacios finales) — sin envolverlo en un lipgloss.Style con
-	// Width/Height, lipgloss.JoinHorizontal mide el bloque por su línea más
-	// larga real (ej. 13 caracteres de "kali@kali:~%") en vez del ancho
-	// real de la pty (157), dejando el panel visualmente angosto/vacío al
-	// unirlo con el sidebar. Bug real encontrado probando en vivo — el
-	// causante NO era el resize (ese era un bug real aparte, ya corregido
-	// por separado), sino este padding faltante.
-	// Bug de UX real reportado probando ("no se ve dónde se está escribiendo,
-	// no parece una terminal real"): investigando la causa en el código
-	// fuente de Bubble Tea (standard_renderer.go) encontramos que su
-	// renderer, en modo alt-screen, SIEMPRE fuerza el cursor real del
-	// terminal a la última línea del frame después de cada redibujado —
-	// cualquier código de posicionamiento (CUP) que pongamos en View() se
-	// sobreescribe de inmediato, sin excepción, en esta versión de la
-	// librería (no hay v2 publicada todavía para resolverlo de raíz). En
-	// vez de pelear con el renderer, dibujamos el cursor NOSOTROS: invertir
-	// el carácter exacto bajo la posición real del cursor del emulador,
-	// usando ansi.Cut (respeta los códigos de color ya presentes en esa
-	// línea en vez de romperlos).
-	cursorPos := m.emu.CursorPosition()
-	rawRender := overlayCursor(m.emu.Render(), cursorPos.X, cursorPos.Y)
-	termContent := lipgloss.NewStyle().
-		Width(m.termWidth).
-		Height(m.termHeight).
-		MaxHeight(m.termHeight).
-		Render(rawRender)
-	termBox := renderTitledBox("OPERATOR", m.termWidth, m.termHeight, termContent, lipgloss.Color("8"))
+	termLines, termTop, termTotal := m.terminalViewport()
+	termContent := renderViewportLines(termLines, m.termWidth, m.termHeight)
+	termBar := renderScrollbar(termTotal, m.termHeight, termTop, m.focus == focusTerminal)
+	termInner := lipgloss.JoinHorizontal(lipgloss.Top, termContent, termBar)
+	termTitle := "OPERATOR"
+	termAccent := lipgloss.Color("8")
+	if m.focus == focusTerminal {
+		termTitle = "▶ OPERATOR"
+		termAccent = lipgloss.Color("6")
+	}
+	termBox := renderTitledBox(termTitle, m.termWidth+1, m.termHeight, termInner, termAccent)
 
 	var target string
 	sessionID, hasSession := currentSessionID(m.s)
@@ -849,34 +1596,57 @@ func (m *tuiModel) View() string {
 	if target != "" {
 		sidebarTitle = "EXITONE — " + target
 	}
-	// El pane con foco de teclado (chat) se resalta con un borde de acento —
-	// mismo lenguaje visual que zellij usa para marcar el pane activo.
+	// El foco nunca depende solo del color: además del borde de acento, el
+	// pane activo lleva un marcador ▶ en el título.
 	sidebarAccent := lipgloss.Color("8")
-	if m.mode == sidebarChat {
+	if m.focus == focusSidebar {
 		sidebarAccent = lipgloss.Color("6")
+		sidebarTitle = "▶ " + sidebarTitle
 	}
-	sidebarContent := lipgloss.NewStyle().
-		Width(sidebarWidth).
-		Height(m.termHeight).
-		MaxHeight(m.termHeight).
-		Padding(0, 1).
-		Render(renderModeTabs(m.mode) + "\n\n" + m.sidebar)
-	sidebarBox := renderTitledBox(sidebarTitle, sidebarWidth, m.termHeight, sidebarContent, sidebarAccent)
+	sideLines := m.sidebarDocument()
+	sideHeight := m.sidebarViewportHeight()
+	sideTop := clamp(m.sideScroll[m.mode], 0, max(0, len(sideLines)-sideHeight))
+	m.sideScroll[m.mode] = sideTop
+	sideHeader := renderViewportLines([]string{renderModeTabs(m.mode, m.sideWidth), ""}, m.sideWidth, sidebarHeaderRows)
+	sideBody := renderViewportLines(sideLines[sideTop:], m.sideWidth, sideHeight)
+	sideContent := sideHeader
+	if sideHeight > 0 {
+		sideContent += "\n" + sideBody
+	}
+	footerRows := m.sidebarFooterRows()
+	if footerRows > 0 {
+		sideContent += "\n" + renderSidebarFooter(m, m.sideWidth)
+	}
+	sideBar := renderViewportLines(nil, 1, sidebarHeaderRows)
+	if sideHeight > 0 {
+		sideBar += "\n" + renderScrollbar(len(sideLines), sideHeight, sideTop, m.focus == focusSidebar)
+	}
+	if footerRows > 0 {
+		sideBar += "\n" + renderViewportLines(nil, 1, footerRows)
+	}
+	sideInner := lipgloss.JoinHorizontal(lipgloss.Top, sideContent, sideBar)
+	sidebarBox := renderTitledBox(sidebarTitle, m.sideWidth+1, m.termHeight, sideInner, sidebarAccent)
 
-	// Bug real encontrado probando en vivo (ya documentado más arriba en
-	// este archivo): unir bloques de alturas distintas con
-	// lipgloss.JoinHorizontal los desalinea. termBox/sidebarBox ya salen con
-	// exactamente la misma altura (m.termHeight + 2 líneas de borde cada
-	// uno) porque ambos se construyen desde el mismo m.termHeight — un
-	// simple espacio en blanco como separador alcanza, ya no hace falta un
-	// divisor "│" dibujado a mano (cada pane ya trae el suyo propio).
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, termBox, " ", sidebarBox)
+	dividerGlyph := "│"
+	dividerColor := lipgloss.Color("8")
+	if m.dragging == dragDivider {
+		dividerGlyph = "┃"
+		dividerColor = lipgloss.Color("6")
+	}
+	divider := lipgloss.NewStyle().Foreground(dividerColor).Render(
+		strings.TrimSuffix(strings.Repeat(dividerGlyph+"\n", m.termHeight+2), "\n"),
+	)
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, termBox, divider, sidebarBox)
 
-	right := "Ctrl+Space sugerencia · F2 modo · Ctrl+P pausar · Esc salir del chat · F1 ayuda · Ctrl+Q salir"
+	right := "F2 vista · F3 foco · Alt+←/→ ancho · Pg↑/Pg↓ scroll · F1 ayuda"
 	if m.paused {
 		right = renderChip(" PAUSADO ", lipgloss.Color("3")) + " " + right
 	}
-	left := fmt.Sprintf(" %s · %s · %s ", orDash(target), m.mode.label(), time.Now().Format("15:04:05"))
+	focusLabel := "TERM"
+	if m.focus == focusSidebar {
+		focusLabel = "PANEL"
+	}
+	left := fmt.Sprintf(" %s · %s · %s · %s ", orDash(target), m.mode.label(), focusLabel, time.Now().Format("15:04:05"))
 	statusBar := renderStatusBar(m.width, left, right)
 
 	view := panes + "\n" + statusBar
@@ -885,6 +1655,347 @@ func (m *tuiModel) View() string {
 		return renderHelpOverlay(m.width, m.height)
 	}
 	return view
+}
+
+func (m *tuiModel) applySplit() {
+	usable := max(2, m.width-7)
+	minWidth := minPaneContentWidth
+	if usable < minPaneContentWidth*2 {
+		minWidth = max(1, usable/3)
+	}
+	m.sideWidth = clamp(int(float64(usable)*m.splitRatio), minWidth, max(minWidth, usable-minWidth))
+	m.termWidth = usable - m.sideWidth
+}
+
+func (m *tuiModel) setSideWidth(width int) {
+	usable := max(2, m.width-7)
+	minWidth := minPaneContentWidth
+	if usable < minPaneContentWidth*2 {
+		minWidth = max(1, usable/3)
+	}
+	width = clamp(width, minWidth, max(minWidth, usable-minWidth))
+	if width == m.sideWidth {
+		return
+	}
+	m.sideWidth = width
+	m.termWidth = usable - width
+	m.splitRatio = float64(width) / float64(usable)
+	m.sidebar = renderSidebar(m)
+	if m.emu != nil && m.ptmx != nil {
+		m.emu.Resize(m.termWidth, m.termHeight)
+		_ = pty.Setsize(m.ptmx, &pty.Winsize{Rows: uint16(m.termHeight), Cols: uint16(m.termWidth)})
+	}
+	m.clampScrolls()
+}
+
+func (m *tuiModel) sidebarViewportHeight() int {
+	return max(0, m.termHeight-sidebarHeaderRows-m.sidebarFooterRows())
+}
+
+func (m *tuiModel) sidebarFooterRows() int {
+	switch m.mode {
+	case sidebarGraph:
+		return 4
+	case sidebarVault:
+		return 5
+	case sidebarChat:
+		return 3
+	}
+	return 0
+}
+
+func renderSidebarFooter(m *tuiModel, width int) string {
+	switch m.mode {
+	case sidebarGraph:
+		return renderGraphFooter(m, width)
+	case sidebarVault:
+		return renderVaultFooter(m, width)
+	case sidebarChat:
+		return renderChatComposer(m, width)
+	default:
+		return renderViewportLines(nil, width, m.sidebarFooterRows())
+	}
+}
+
+func (m *tuiModel) handleMouse(msg tea.MouseEvent) {
+	dividerX := m.termWidth + 3
+	termBarX := m.termWidth + 1
+	sideBarX := m.width - 2
+
+	if msg.IsWheel() {
+		delta := scrollStep
+		if msg.Button == tea.MouseButtonWheelDown {
+			delta = -scrollStep
+		}
+		if msg.X < dividerX {
+			if m.mode == sidebarVault {
+				m.clearVaultReveal()
+			}
+			m.focus = focusTerminal
+			m.scrollTerminal(delta)
+		} else if msg.X > dividerX {
+			m.focus = focusSidebar
+			m.scrollSidebar(-delta)
+		}
+		return
+	}
+
+	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		// Las pestañas parecen controles, así que también deben comportarse
+		// como tales con mouse. El teclado conserva F2 como ruta primaria.
+		if msg.Y == 1 {
+			if mode, ok := sidebarModeAtX(msg.X-(dividerX+2), m.sideWidth); ok {
+				if m.mode == sidebarVault && mode != sidebarVault {
+					m.clearVaultReveal()
+				}
+				m.mode = mode
+				m.focus = focusSidebar
+				m.sidebar = renderSidebar(m)
+				m.clampScrolls()
+				return
+			}
+		}
+		switch msg.X {
+		case dividerX:
+			m.dragging = dragDivider
+		case termBarX:
+			if m.mode == sidebarVault {
+				m.clearVaultReveal()
+			}
+			m.focus = focusTerminal
+			m.dragging = dragTerminalScrollbar
+			m.dragTerminalScrollbar(msg.Y - 1)
+		case sideBarX:
+			m.focus = focusSidebar
+			bodyY := msg.Y - 1 - sidebarHeaderRows
+			if bodyY >= 0 && bodyY < m.sidebarViewportHeight() {
+				m.dragging = dragSidebarScrollbar
+				m.dragSidebarScrollbar(bodyY)
+			}
+		default:
+			if msg.X < dividerX {
+				if m.mode == sidebarVault {
+					m.clearVaultReveal()
+				}
+				m.focus = focusTerminal
+			} else {
+				m.focus = focusSidebar
+				if m.mode == sidebarGraph {
+					bodyY := msg.Y - 1 - sidebarHeaderRows
+					if bodyY >= 0 && bodyY < m.sidebarViewportHeight() {
+						docLine := m.sideScroll[sidebarGraph] + bodyY
+						rowIndex := docLine - graphHeaderRows
+						if rowIndex >= 0 && rowIndex < len(m.graphRows) {
+							m.graphCursor = rowIndex
+							m.sidebar = renderSidebar(m)
+						}
+					}
+				}
+				if m.mode == sidebarVault {
+					bodyY := msg.Y - 1 - sidebarHeaderRows
+					if bodyY >= 0 && bodyY < m.sidebarViewportHeight() {
+						docLine := m.sideScroll[sidebarVault] + bodyY
+						rowIndex := docLine - vaultHeaderRows
+						if rowIndex >= 0 && rowIndex < len(m.vaultRows) {
+							if rowIndex != m.vaultCursor {
+								m.clearVaultReveal()
+							}
+							m.vaultCursor = rowIndex
+							m.sidebar = renderSidebar(m)
+						}
+					}
+				}
+			}
+		}
+		return
+	}
+
+	if msg.Action == tea.MouseActionMotion {
+		switch m.dragging {
+		case dragDivider:
+			m.setSideWidth(m.width - msg.X - 4)
+		case dragTerminalScrollbar:
+			m.dragTerminalScrollbar(msg.Y - 1)
+		case dragSidebarScrollbar:
+			m.dragSidebarScrollbar(msg.Y - 1 - sidebarHeaderRows)
+		}
+		return
+	}
+
+	if msg.Action == tea.MouseActionRelease {
+		m.dragging = dragNone
+	}
+}
+
+func (m *tuiModel) scrollFocused(delta int) {
+	if m.focus == focusTerminal {
+		m.scrollTerminal(delta)
+		return
+	}
+	m.scrollSidebar(-delta)
+}
+
+func (m *tuiModel) scrollFocusedToStart() {
+	if m.focus == focusTerminal {
+		m.termScroll = m.terminalScrollbackLen()
+		return
+	}
+	m.sideScroll[m.mode] = 0
+}
+
+func (m *tuiModel) scrollFocusedToEnd() {
+	if m.focus == focusTerminal {
+		m.termScroll = 0
+		return
+	}
+	m.scrollSidebarToEnd()
+}
+
+func (m *tuiModel) scrollTerminal(delta int) {
+	m.termScroll = clamp(m.termScroll+delta, 0, m.terminalScrollbackLen())
+}
+
+func (m *tuiModel) scrollSidebar(delta int) {
+	maxTop := max(0, len(m.sidebarDocument())-m.sidebarViewportHeight())
+	m.sideScroll[m.mode] = clamp(m.sideScroll[m.mode]+delta, 0, maxTop)
+}
+
+func (m *tuiModel) scrollSidebarToEnd() {
+	m.sideScroll[m.mode] = max(0, len(m.sidebarDocument())-m.sidebarViewportHeight())
+}
+
+func (m *tuiModel) dragTerminalScrollbar(y int) {
+	maxTop := m.terminalScrollbackLen()
+	top := scrollTopFromMouse(y, m.termHeight, maxTop)
+	m.termScroll = maxTop - top
+}
+
+func (m *tuiModel) dragSidebarScrollbar(y int) {
+	maxTop := max(0, len(m.sidebarDocument())-m.sidebarViewportHeight())
+	m.sideScroll[m.mode] = scrollTopFromMouse(y, m.sidebarViewportHeight(), maxTop)
+}
+
+func (m *tuiModel) clampScrolls() {
+	m.termScroll = clamp(m.termScroll, 0, m.terminalScrollbackLen())
+	maxTop := max(0, len(m.sidebarDocument())-m.sidebarViewportHeight())
+	m.sideScroll[m.mode] = clamp(m.sideScroll[m.mode], 0, maxTop)
+}
+
+func (m *tuiModel) terminalScrollbackLen() int {
+	if m.emu == nil || m.emu.IsAltScreen() {
+		return 0
+	}
+	return m.emu.ScrollbackLen()
+}
+
+// terminalViewport materializa solo las filas visibles. El scrollback puede
+// contener 10k líneas; reconstruirlo entero en cada keypress haría lenta la
+// terminal precisamente cuando más output produce una herramienta.
+func (m *tuiModel) terminalViewport() ([]string, int, int) {
+	if m.emu == nil {
+		return nil, 0, m.termHeight
+	}
+	rendered := m.emu.Render()
+	if m.termScroll == 0 {
+		cursor := m.emu.CursorPosition()
+		rendered = overlayCursor(rendered, cursor.X, cursor.Y)
+	}
+	screen := strings.Split(rendered, "\n")
+	if len(screen) > m.termHeight {
+		screen = screen[:m.termHeight]
+	}
+	for len(screen) < m.termHeight {
+		screen = append(screen, "")
+	}
+
+	sbLen := m.terminalScrollbackLen()
+	top := clamp(sbLen-m.termScroll, 0, sbLen)
+	visible := make([]string, 0, m.termHeight)
+	for docIndex := top; docIndex < top+m.termHeight; docIndex++ {
+		if docIndex >= sbLen {
+			visible = append(visible, screen[docIndex-sbLen])
+			continue
+		}
+		line := m.emu.Scrollback().Line(docIndex)
+		var b strings.Builder
+		for i := range line {
+			cell := &line[i]
+			if cell.Width == 0 {
+				continue
+			}
+			content := cell.Content
+			if content == "" {
+				content = " "
+			}
+			b.WriteString(cell.Style.Styled(content))
+		}
+		visible = append(visible, b.String())
+	}
+	return visible, top, sbLen + m.termHeight
+}
+
+func (m *tuiModel) sidebarDocument() []string {
+	if m.sideWidth < 1 {
+		return nil
+	}
+	return strings.Split(ansi.Wrap(m.sidebar, m.sideWidth, "/_:.'"), "\n")
+}
+
+func renderViewportLines(lines []string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	out := make([]string, height)
+	for i := range height {
+		line := ""
+		if i < len(lines) {
+			line = ansi.Cut(lines[i], 0, width)
+		}
+		out[i] = lipgloss.NewStyle().Width(width).MaxWidth(width).Render(line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func renderScrollbar(total, height, top int, active bool) string {
+	if height <= 0 {
+		return ""
+	}
+	thumbSize, thumbTop := height, 0
+	if total > height {
+		thumbSize = max(1, height*height/total)
+		thumbTop = clamp(top*(height-thumbSize)/(total-height), 0, height-thumbSize)
+	}
+	thumbColor := lipgloss.Color("7")
+	if active {
+		thumbColor = lipgloss.Color("6")
+	}
+	rows := make([]string, height)
+	for i := range height {
+		glyph := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("░")
+		if i >= thumbTop && i < thumbTop+thumbSize {
+			glyph = lipgloss.NewStyle().Foreground(thumbColor).Render("█")
+		}
+		rows[i] = glyph
+	}
+	return strings.Join(rows, "\n")
+}
+
+func scrollTopFromMouse(y, height, maxTop int) int {
+	if maxTop <= 0 || height <= 1 {
+		return 0
+	}
+	y = clamp(y, 0, height-1)
+	return y * maxTop / (height - 1)
+}
+
+func clamp(value, low, high int) int {
+	if value < low {
+		return low
+	}
+	if value > high {
+		return high
+	}
+	return value
 }
 
 // overlayCursor invierte visualmente (fondo/texto intercambiados) el
@@ -918,10 +2029,10 @@ func overlayCursor(rendered string, x, y int) string {
 func renderTitledBox(title string, width, height int, content string, accentColor lipgloss.Color) string {
 	style := lipgloss.NewStyle().Foreground(accentColor)
 	label := " " + title + " "
-	if len(label) > width {
-		label = truncate(label, width)
+	if lipgloss.Width(label) > width {
+		label = ansi.Truncate(label, width, "")
 	}
-	dashes := width - 1 - len(label)
+	dashes := width - 1 - lipgloss.Width(label)
 	if dashes < 0 {
 		dashes = 0
 	}
@@ -945,8 +2056,8 @@ func renderTitledBox(title string, width, height int, content string, accentColo
 // renderModeTabs — barra de pestañas estilo zellij (pestañas con fondo
 // sólido, no un label de texto suelto): reemplaza el `[OVERVIEW]` de antes,
 // y de paso hace visible que existen 4 modos sin tener que abrir F1.
-func renderModeTabs(active sidebarMode) string {
-	labels := []string{"Overview", "Graph", "Vault", "Chat"}
+func renderModeTabs(active sidebarMode, width int) string {
+	labels := modeTabLabels(width)
 	var parts []string
 	for i, l := range labels {
 		if sidebarMode(i) == active {
@@ -958,7 +2069,29 @@ func renderModeTabs(active sidebarMode) string {
 				Foreground(lipgloss.Color("8")).Padding(0, 1).Render(l))
 		}
 	}
-	return strings.Join(parts, "")
+	return ansi.Truncate(strings.Join(parts, ""), width, "")
+}
+
+func modeTabLabels(width int) []string {
+	if width < 30 {
+		return []string{"OVR", "GRF", "VLT", "CHAT"}
+	}
+	return []string{"Overview", "Graph", "Vault", "Chat"}
+}
+
+func sidebarModeAtX(x, width int) (sidebarMode, bool) {
+	if x < 0 || x >= width {
+		return sidebarOverview, false
+	}
+	offset := 0
+	for i, label := range modeTabLabels(width) {
+		tabWidth := lipgloss.Width(label) + 2 // Padding(0, 1) de renderModeTabs.
+		if x >= offset && x < offset+tabWidth {
+			return sidebarMode(i), true
+		}
+		offset += tabWidth
+	}
+	return sidebarOverview, false
 }
 
 // renderStatusBar — status-line de dos segmentos con fondo sólido, estilo
@@ -971,7 +2104,7 @@ func renderStatusBar(width int, left, right string) string {
 	}
 	content := left + strings.Repeat(" ", gap) + right
 	if lipgloss.Width(content) > width {
-		content = truncate(content, width)
+		content = ansi.Truncate(content, width, "")
 	}
 	return bar.Width(width).Render(content)
 }
@@ -999,12 +2132,21 @@ func renderHelpOverlay(width, height int) string {
 			"",
 			"Ctrl+Space   insertar la sugerencia de mayor score en el prompt (nunca la ejecuta)",
 			"F2           cambiar de vista en el panel: Overview → Graph → Vault → Chat",
-			"Esc          (solo en Chat) volver el foco a la terminal embebida",
+			"F3           alternar foco entre terminal y panel",
+			"Alt+←/→      mover el divisor central (también puedes arrastrarlo)",
+			"PgUp/PgDown  desplazar el pane enfocado; Ctrl+Home/End salta a los extremos",
+			"Rueda        desplazar el pane bajo el puntero",
+			"Esc          devolver el teclado a la terminal sin ocultar la vista actual",
 			"Ctrl+P       pausar/reanudar el refresco del panel (para leer tranquilo)",
 			"F1           esta ayuda — cualquier tecla la cierra",
 			"Ctrl+Q       salir de ExitOne (el shell embebido se cierra con él)",
 			"",
-			"En Chat, lo que escribas va al asistente (Enter para preguntar), no al shell.",
+			"Graph: ↑/↓ o j/k selecciona · ←/→ o h/l pliega · Enter alterna",
+			"       / filtra · c limpia filtro · r restablece · Esc vuelve al terminal",
+			"Vault: ↑/↓ o j/k selecciona · ←/→ pliega · / filtra · r restablece",
+			"       v + v revela solo la seleccionada por 10s; navegar la oculta",
+			"Chat: Enter envía · ↑/↓ historial · Ctrl+C cancela · Ctrl+R reintenta",
+			"      Ctrl+U limpia input · Ctrl+L limpia transcript · Ctrl+W borra palabra",
 			"En cualquier otro modo, todo lo demás se manda tal cual al shell embebido.",
 			"",
 			lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("(pulsa cualquier tecla para volver)"),
@@ -1045,9 +2187,9 @@ func renderSidebar(m *tuiModel) string {
 
 	switch m.mode {
 	case sidebarGraph:
-		renderAttackSurfaceGraph(&b, m.s, sessionID)
+		renderAttackSurfaceGraph(&b, m, sessionID)
 	case sidebarVault:
-		renderVault(&b, m.s, sessionID)
+		renderVault(&b, m, sessionID)
 	case sidebarChat:
 		renderChat(&b, m)
 	default:
@@ -1059,198 +2201,1083 @@ func renderSidebar(m *tuiModel) string {
 
 func renderOverview(b *strings.Builder, m *tuiModel, sessionID string) {
 	s := m.s
+	heading := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	commandStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("ACTIVIDAD") + "\n")
-	var evTool, evAt string
-	if err := s.DB.QueryRow(`SELECT tool_name, created_at FROM evidence ORDER BY created_at DESC LIMIT 1`).Scan(&evTool, &evAt); err == nil {
-		fmt.Fprintf(b, "última evidencia: %s (%s)\n", evTool, relTime(evAt))
+	// Jerarquía para un operador experto: acción primero, contexto mínimo,
+	// después estado y cola. Nada de explicación introductoria de tooling.
+	b.WriteString(heading.Render("NEXT") + "\n")
+	var id, source, phase, risk, tool, cmd, explanation string
+	var score float64
+	topErr := s.DB.QueryRow(`
+		SELECT id, source, phase_key, risk_level, tool,
+		       command_template_rendered, explanation, score
+		FROM candidate
+		WHERE session_id = ? AND status = 'proposed'
+		ORDER BY score DESC LIMIT 1`, sessionID,
+	).Scan(&id, &source, &phase, &risk, &tool, &cmd, &explanation, &score)
+	if topErr == nil {
+		if cmd == "" {
+			cmd = explanation
+		}
+		fmt.Fprintf(b, "%s %.2f  %s · %s/%s · %s\n", renderScoreBar(score), score, strings.ToUpper(tool), phase, risk, source)
+		b.WriteString(commandStyle.Render("$ "+cmd) + "\n")
+		b.WriteString(muted.Render("Ctrl+Space insert · exitone why "+firstN(id, 8)) + "\n")
 	} else {
-		b.WriteString("última evidencia: (ninguna)\n")
+		b.WriteString(muted.Render("No pending candidate · ingest evidence") + "\n")
 	}
-	var candTool, candAt string
-	if err := s.DB.QueryRow(`SELECT tool, created_at FROM candidate WHERE session_id = ? ORDER BY created_at DESC LIMIT 1`, sessionID).Scan(&candTool, &candAt); err == nil {
-		fmt.Fprintf(b, "último candidato: %s (%s)\n", candTool, relTime(candAt))
-	} else {
-		b.WriteString("último candidato: (ninguno)\n")
-	}
-	var jobStatus, jobQueuedAt string
-	if err := s.DB.QueryRow(`SELECT status, queued_at FROM strategy_job WHERE session_id = ?`, sessionID).Scan(&jobStatus, &jobQueuedAt); err == nil {
-		switch jobStatus {
-		case "pending", "running":
-			b.WriteString("razonamiento exploratorio: " + renderChip(" en curso ", lipgloss.Color("5")) + "\n")
-		case "failed":
-			b.WriteString("razonamiento exploratorio: falló\n")
-		default:
-			fmt.Fprintf(b, "razonamiento exploratorio: al día (%s)\n", relTime(jobQueuedAt))
+
+	if m.narrationLoading || m.narration != "" {
+		b.WriteString("\n" + heading.Render("WHY / RISK") + "\n")
+		if m.narrationLoading {
+			b.WriteString(renderChip(" razonando… ", lipgloss.Color("5")) + "\n")
+		} else {
+			b.WriteString(compactNarration(m.narration, m.sideWidth, 3) + "\n")
 		}
 	}
 
-	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("GUÍA") + "\n")
-	switch {
-	case m.narrationLoading:
-		b.WriteString(renderChip(" razonando… ", lipgloss.Color("5")) + "\n")
-	case m.narration != "":
-		b.WriteString(wrapText(m.narration, sidebarWidth) + "\n")
-	default:
-		b.WriteString("(se narra sola cuando cambia la sugerencia top)\n")
-	}
-
-	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("ETAPAS") + "\n")
+	b.WriteString("\n" + heading.Render("STATE") + "\n")
 	if stages, err := stage.Estimate(s, sessionID); err == nil {
 		for _, st := range stages {
-			fmt.Fprintf(b, "%-22s %s\n", st.Name, stageStatusStyled(st.Status))
+			mark := "·"
+			switch st.Status {
+			case stage.Sufficient:
+				mark = "✓"
+			case stage.Active, stage.Partial:
+				mark = "›"
+			case stage.Blocked:
+				mark = "!"
+			case stage.Reopened:
+				mark = "↻"
+			}
+			fmt.Fprintf(b, "%s %s · %s\n", mark, st.Name, stageStatusStyled(st.Status))
 		}
 	}
 
-	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("SUGERENCIAS") + "\n")
+	b.WriteString("\n" + heading.Render("QUEUE") + "\n")
 	rows, err := s.DB.Query(`
-		SELECT source, kind, phase_key, risk_level, command_template_rendered, explanation, score FROM candidate
-		WHERE session_id = ? AND status = 'proposed' ORDER BY score DESC LIMIT 4`, sessionID)
+		SELECT phase_key, risk_level, command_template_rendered, explanation, score FROM candidate
+		WHERE session_id = ? AND status = 'proposed' ORDER BY score DESC LIMIT 3 OFFSET 1`, sessionID)
 	if err == nil {
 		any := false
 		for rows.Next() {
 			any = true
-			var source, kind, phase, risk, cmd, explanation string
+			var phase, risk, cmd, explanation string
 			var score float64
-			rows.Scan(&source, &kind, &phase, &risk, &cmd, &explanation, &score)
+			rows.Scan(&phase, &risk, &cmd, &explanation, &score)
 			if cmd == "" {
 				cmd = explanation
 			}
-			prefix := fmt.Sprintf("%s %.2f [%s/%s %s %s] ", renderScoreBar(score), score, source, kind, phase, risk)
-			fmt.Fprintf(b, "%s%s\n", prefix, truncate(cmd, max(4, sidebarWidth-lipgloss.Width(prefix))))
+			fmt.Fprintf(b, "%s %.2f  %s/%s · %s\n", renderScoreBar(score), score, phase, risk, cmd)
 		}
 		rows.Close()
 		if !any {
-			b.WriteString("(ninguna pendiente)\n")
+			b.WriteString(muted.Render("no additional candidates") + "\n")
 		}
 	}
 
-	b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("OBJECTIVES ABIERTOS") + "\n")
-	orows, err := s.DB.Query(`SELECT intent_key FROM methodology_objective WHERE session_id = ? AND status = 'open'`, sessionID)
+	b.WriteString("\n" + heading.Render("OPEN PATHS") + "\n")
+	orows, err := s.DB.Query(`
+		SELECT op.path_key FROM objective_path op
+		JOIN methodology_objective mo ON mo.id = op.objective_id
+		WHERE mo.session_id = ? AND op.status = 'open'
+		ORDER BY mo.created_at, op.created_at LIMIT 6`, sessionID)
 	if err == nil {
 		any := false
 		for orows.Next() {
 			any = true
-			var k string
-			orows.Scan(&k)
-			b.WriteString("? " + k + "\n")
+			var path string
+			orows.Scan(&path)
+			b.WriteString("› " + path + "\n")
 		}
 		orows.Close()
 		if !any {
-			b.WriteString("(ninguno)\n")
+			b.WriteString(muted.Render("none") + "\n")
 		}
+	}
+
+	b.WriteString("\n" + heading.Render("LIVE") + "\n")
+	var evTool, evAt string
+	if err := s.DB.QueryRow(`
+		SELECT e.tool_name, e.created_at FROM evidence e
+		JOIN event ev ON ev.id = e.event_id
+		WHERE ev.session_id = ? ORDER BY e.created_at DESC LIMIT 1`, sessionID).Scan(&evTool, &evAt); err == nil {
+		fmt.Fprintf(b, "evidence %s · %s\n", evTool, relTime(evAt))
+	} else {
+		b.WriteString(muted.Render("no evidence yet") + "\n")
+	}
+	var jobStatus string
+	if err := s.DB.QueryRow(`SELECT status FROM strategy_job WHERE session_id = ?`, sessionID).Scan(&jobStatus); err == nil {
+		fmt.Fprintf(b, "strategy %s\n", jobStatus)
 	}
 }
 
-// renderChat — modo de chat embebido: mismo `llm.Ask`/`llm.BuildContextSummary`
-// que usa `exitone ask` en otra terminal, solo que acá el historial vive en
-// memoria de la sesión de TUI (no se persiste — igual que `ask` hoy solo
-// deja rastro en el debug log, no en una tabla dedicada).
+// renderChat dibuja únicamente el transcript. El compositor queda fijo al
+// pie del pane (renderChatComposer), así no desaparece cuando se consulta
+// historial y su barra de scroll representa solo la conversación.
 func renderChat(b *strings.Builder, m *tuiModel) {
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("ASISTENTE") + "\n\n")
+	heading := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	b.WriteString(heading.Render("SESSION CHAT") + "  " + muted.Render("read-only · in-memory") + "\n")
+	b.WriteString(muted.Render("Grounded in the current graph and evidence; never executes commands.") + "\n\n")
 	if len(m.chatHistory) == 0 {
-		b.WriteString("(sin preguntas todavía — escribí y Enter)\n\n")
+		b.WriteString(heading.Render("QUICK START") + "\n")
+		b.WriteString("› ¿Qué falta por investigar?\n")
+		b.WriteString("› ¿Qué evidencia respalda esta hipótesis?\n")
+		b.WriteString("› ¿Qué relación existe entre host y servicio?\n")
+		b.WriteString("\n" + muted.Render("Write below · Enter sends · ↑ recalls") + "\n")
 	}
 	for _, turn := range m.chatHistory {
-		fmt.Fprintf(b, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("> "+turn.question))
+		stamp := ""
+		if !turn.startedAt.IsZero() {
+			stamp = "  " + turn.startedAt.Format("15:04")
+		}
+		b.WriteString(heading.Render("YOU") + muted.Render(stamp) + "\n")
+		b.WriteString(wrapText(turn.question, m.sideWidth) + "\n")
 		switch {
 		case turn.err != nil:
-			fmt.Fprintf(b, "%s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(turn.err.Error()))
+			b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("1")).Render("ERROR") + "\n")
+			b.WriteString(wrapText(compactChatError(turn.err), m.sideWidth) + "\n")
+			b.WriteString(muted.Render("Ctrl+R retry") + "\n")
 		case turn.answer != "":
-			b.WriteString(wrapText(turn.answer, sidebarWidth) + "\n")
+			meta := "grounded"
+			if turn.elapsed > 0 {
+				meta += fmt.Sprintf(" · %.1fs", turn.elapsed.Seconds())
+			}
+			b.WriteString(heading.Render("EXITONE") + "  " + muted.Render(meta) + "\n")
+			b.WriteString(renderChatAnswer(turn.answer) + "\n")
 		default:
-			b.WriteString(renderChip(" pensando… ", lipgloss.Color("5")) + "\n")
+			elapsed := time.Since(turn.startedAt).Round(time.Second)
+			b.WriteString(renderChip(" querying graph ", lipgloss.Color("5")) + muted.Render(" "+elapsed.String()) + "\n")
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(strings.Repeat("─", sidebarWidth)) + "\n")
-	cursor := "_"
-	if m.chatAsking {
-		cursor = ""
-	}
-	fmt.Fprintf(b, "> %s%s\n", m.chatInput, cursor)
 }
 
-// renderAttackSurfaceGraph — tomado de RedAmon (grafo del attack surface),
-// adaptado a un árbol ASCII porque un layout de grafo real (force-directed)
-// no cabe en un panel de texto de 42 columnas. host → servicios/shares →
-// dominio, por indentación — es la misma información que RELACIONES en
-// `exitone status`, pero como estructura navegable en vez de lista plana.
-func renderAttackSurfaceGraph(b *strings.Builder, s *store.Store, sessionID string) {
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("ATTACK SURFACE") + "\n")
-	hosts, err := s.DB.Query(`SELECT id, canonical_value FROM entity WHERE session_id = ? AND type = 'host'`, sessionID)
-	if err != nil {
-		return
-	}
-	type hostRow struct{ id, value string }
-	var hs []hostRow
-	for hosts.Next() {
-		var h hostRow
-		hosts.Scan(&h.id, &h.value)
-		hs = append(hs, h)
-	}
-	hosts.Close()
+func renderChatComposer(m *tuiModel, width int) string {
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	accent := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	divider := muted.Render(strings.Repeat("─", max(1, width)))
+	prefix := "ASK › "
+	available := max(1, width-lipgloss.Width(prefix))
+	showCursor := m.focus == focusSidebar && !m.showHelp
+	input := renderChatInput(m.chatInput, m.chatCursor, available, showCursor)
+	line := accent.Render(prefix) + input
 
-	if len(hs) == 0 {
-		b.WriteString("(sin entidades todavía)\n")
-		return
+	hint := "Enter send · ↑ history · Ctrl+L clear · Esc terminal"
+	if len([]rune(m.chatInput)) >= maxChatInputRunes {
+		hint = fmt.Sprintf("input limit · %d chars · Ctrl+U clear", maxChatInputRunes)
+	} else if m.chatAsking {
+		hint = "query running · Ctrl+C cancel · draft next question"
+	} else if lastChatFailed(m.chatHistory) {
+		hint = "Enter send · Ctrl+R retry · Ctrl+L clear · Esc terminal"
 	}
+	return renderViewportLines([]string{divider, line, muted.Render(hint)}, width, 3)
+}
 
-	for _, h := range hs {
-		fmt.Fprintf(b, "%s\n", h.value)
-		rows, _ := s.DB.Query(`
-			SELECT r.kind, e2.type, e2.canonical_value
-			FROM relationship r JOIN entity e2 ON e2.id = r.target_entity_id
-			WHERE r.source_entity_id = ?`, h.id)
-		type rel struct{ kind, etype, value string }
-		var rels []rel
-		for rows.Next() {
-			var rr rel
-			rows.Scan(&rr.kind, &rr.etype, &rr.value)
-			rels = append(rels, rr)
+func renderChatInput(input string, cursor, width int, showCursor bool) string {
+	if width < 1 {
+		return ""
+	}
+	runes := []rune(input)
+	cursor = clamp(cursor, 0, len(runes))
+	before := string(runes[:cursor])
+	cursorColumn := lipgloss.Width(before)
+	start := max(0, cursorColumn-width+1)
+	visible := ansi.Cut(input+" ", start, start+width)
+	if !showCursor {
+		return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(visible)
+	}
+	x := max(0, cursorColumn-start)
+	left := ansi.Cut(visible, 0, x)
+	at := ansi.Cut(visible, x, x+1)
+	if at == "" {
+		at = " "
+	}
+	right := ansi.Cut(visible, x+1, width)
+	withCursor := left + "\x1b[7m" + at + "\x1b[27m" + right
+	return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(withCursor)
+}
+
+func renderChatAnswer(answer string) string {
+	answer = strings.ReplaceAll(answer, "\r\n", "\n")
+	lines := strings.Split(strings.TrimSpace(answer), "\n")
+	var out []string
+	inCode := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inCode = !inCode
+			continue
 		}
-		rows.Close()
-		for i, rr := range rels {
-			branch := "├─"
-			if i == len(rels)-1 {
-				branch = "└─"
+		if inCode {
+			out = append(out, lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("│ "+line))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			title := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
+			out = append(out, lipgloss.NewStyle().Bold(true).Render(title))
+			continue
+		}
+		// El markdown pesado se ve ruidoso en un pane angosto; conservamos
+		// listas y código, pero quitamos marcadores de énfasis redundantes.
+		line = strings.ReplaceAll(strings.ReplaceAll(line, "**", ""), "__", "")
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func compactChatError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Error())
+	if strings.Contains(strings.ToLower(message), "context deadline exceeded") {
+		return "The local model timed out after 90s. Retry or verify the LLM runtime."
+	}
+	if strings.Contains(strings.ToLower(message), "context canceled") {
+		return "Query cancelled."
+	}
+	return truncate(message, 180)
+}
+
+func lastChatFailed(history []chatTurn) bool {
+	return len(history) > 0 && history[len(history)-1].err != nil
+}
+
+type graphEntity struct {
+	id, entityType, value, attrs string
+}
+
+type graphRelation struct {
+	source, target, kind string
+	confidence           float64
+}
+
+// renderAttackSurfaceGraph convierte el grafo persistido completo en un
+// árbol navegable, no solo host→service. Los ciclos y relaciones múltiples
+// se muestran como cross-links y cada entidad se materializa una sola vez.
+// Dos queries reemplazan el patrón N+1 de la versión anterior.
+func renderAttackSurfaceGraph(b *strings.Builder, m *tuiModel, sessionID string) {
+	width := m.sideWidth
+	heading := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+
+	entities, relations, err := loadAttackSurfaceGraph(m.s, sessionID)
+	if err != nil {
+		m.graphRows = nil
+		b.WriteString(heading.Render("ATTACK SURFACE") + "\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(truncate(sanitizeTerminalText(err.Error()), width)) + "\n\n")
+		return
+	}
+
+	selected, hadSelection := m.selectedGraphRow()
+	visible := graphVisibleSet(entities, relations, m.graphFilter)
+	collapsed := m.graphCollapsed
+	if strings.TrimSpace(m.graphFilter) != "" {
+		// Un filtro nunca debe dejar un match escondido dentro de una rama
+		// colapsada; el estado de colapso original se conserva al limpiarlo.
+		collapsed = map[string]bool{}
+	}
+	rows := buildGraphRows(entities, relations, visible, collapsed)
+	m.graphRows = rows
+	m.graphCursor = clamp(m.graphCursor, 0, max(0, len(rows)-1))
+	if hadSelection {
+		matchedExact := false
+		for i := range rows {
+			if rows[i].entityID == selected.entityID && rows[i].parentID == selected.parentID &&
+				rows[i].relation == selected.relation && rows[i].crossLink == selected.crossLink {
+				m.graphCursor = i
+				matchedExact = true
+				break
 			}
-			fmt.Fprintf(b, "%s %s: %s\n", branch, strings.ToLower(rr.etype), truncate(rr.value, sidebarWidth-16))
 		}
+		if !matchedExact {
+			for i := range rows {
+				if rows[i].entityID == selected.entityID && !rows[i].crossLink {
+					m.graphCursor = i
+					break
+				}
+			}
+		}
+	}
+
+	hosts, services := 0, 0
+	for _, entity := range entities {
+		switch entity.entityType {
+		case "host":
+			hosts++
+		case "service":
+			services++
+		}
+	}
+	title := heading.Render("ATTACK SURFACE")
+	if m.graphFilter != "" {
+		title += "  " + renderChip(" / "+sanitizeTerminalText(m.graphFilter)+" ", lipgloss.Color("4"))
+	}
+	b.WriteString(ansi.Truncate(title, width, "") + "\n")
+	stats := fmt.Sprintf("%d nodes · %d links · %d hosts · %d services", len(entities), len(relations), hosts, services)
+	if m.graphFilter != "" {
+		stats += fmt.Sprintf(" · %d visible", countPrimaryGraphRows(rows))
+	}
+	b.WriteString(muted.Render(truncate(stats, width)) + "\n")
+	b.WriteString(muted.Render(truncate("◈ host  ● service  ◆ identity  ◇ domain", width)) + "\n")
+
+	if len(entities) == 0 {
+		b.WriteString(muted.Render("No entities yet · ingest evidence to build the graph") + "\n")
+		return
+	}
+	if len(rows) == 0 {
+		b.WriteString(muted.Render("No matches · press c to clear the filter") + "\n")
+		return
+	}
+	for i, row := range rows {
+		b.WriteString(renderGraphRow(row, i == m.graphCursor, m.focus == focusSidebar, width) + "\n")
 	}
 }
 
-// renderVault — tomado de Pentest Copilot (vault de credenciales
-// deduplicado, siempre visible). Aquí: todas las identidades descubiertas
-// en la sesión, con su provenance (confirmed/user-provided/inferred-llm) —
-// exactamente la distinción que la Prueba 6 del protocolo de validación
-// exigía que nunca se perdiera de vista.
-func renderVault(b *strings.Builder, s *store.Store, sessionID string) {
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("IDENTITY VAULT") + "\n")
-	rows, err := s.DB.Query(`SELECT canonical_value, attrs FROM entity WHERE session_id = ? AND type = 'identity' ORDER BY canonical_value`, sessionID)
+func loadAttackSurfaceGraph(s *store.Store, sessionID string) (map[string]graphEntity, []graphRelation, error) {
+	entities := make(map[string]graphEntity)
+	rows, err := s.DB.Query(`
+		SELECT id, type, canonical_value, attrs FROM entity
+		WHERE session_id = ? ORDER BY type, canonical_value`, sessionID)
 	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var entity graphEntity
+		if err := rows.Scan(&entity.id, &entity.entityType, &entity.value, &entity.attrs); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		entities[entity.id] = entity
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	rows, err = s.DB.Query(`
+		SELECT r.source_entity_id, r.target_entity_id, r.kind, r.confidence
+		FROM relationship r
+		JOIN entity source ON source.id = r.source_entity_id
+		JOIN entity target ON target.id = r.target_entity_id
+		WHERE source.session_id = ? AND target.session_id = ? AND r.valid_to IS NULL
+		ORDER BY r.kind, source.canonical_value, target.canonical_value`, sessionID, sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var relations []graphRelation
+	for rows.Next() {
+		var relation graphRelation
+		if err := rows.Scan(&relation.source, &relation.target, &relation.kind, &relation.confidence); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		relations = append(relations, relation)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	return entities, relations, nil
+}
+
+func graphVisibleSet(entities map[string]graphEntity, relations []graphRelation, filter string) map[string]bool {
+	visible := make(map[string]bool, len(entities))
+	query := strings.ToLower(strings.TrimSpace(filter))
+	if query == "" {
+		for id := range entities {
+			visible[id] = true
+		}
+		return visible
+	}
+
+	matched := make(map[string]bool)
+	for id, entity := range entities {
+		haystack := strings.ToLower(entity.entityType + " " + entity.value + " " + entity.attrs)
+		if strings.Contains(haystack, query) {
+			matched[id] = true
+			visible[id] = true
+		}
+	}
+	for _, relation := range relations {
+		if strings.Contains(strings.ToLower(relation.kind), query) {
+			matched[relation.source], matched[relation.target] = true, true
+			visible[relation.source], visible[relation.target] = true, true
+		}
+	}
+
+	// Ancestors explain where a result hangs in the attack surface; direct
+	// children give one-hop operational context without expanding an entire
+	// connected component for every search.
+	parents := make(map[string][]string)
+	for _, relation := range relations {
+		parents[relation.target] = append(parents[relation.target], relation.source)
+	}
+	queue := make([]string, 0, len(matched))
+	for id := range matched {
+		queue = append(queue, id)
+	}
+	for head := 0; head < len(queue); head++ {
+		id := queue[head]
+		for _, parent := range parents[id] {
+			if visible[parent] {
+				continue
+			}
+			visible[parent] = true
+			queue = append(queue, parent)
+		}
+	}
+	for _, relation := range relations {
+		if matched[relation.source] {
+			visible[relation.target] = true
+		}
+	}
+	return visible
+}
+
+func buildGraphRows(entities map[string]graphEntity, relations []graphRelation, visible map[string]bool, collapsed map[string]bool) []graphRow {
+	outgoing := make(map[string][]graphRelation)
+	incoming := make(map[string][]graphRelation)
+	for _, relation := range relations {
+		if !visible[relation.source] || !visible[relation.target] {
+			continue
+		}
+		outgoing[relation.source] = append(outgoing[relation.source], relation)
+		incoming[relation.target] = append(incoming[relation.target], relation)
+	}
+	for source := range outgoing {
+		sort.SliceStable(outgoing[source], func(i, j int) bool {
+			left, right := entities[outgoing[source][i].target], entities[outgoing[source][j].target]
+			if graphTypePriority(left.entityType) != graphTypePriority(right.entityType) {
+				return graphTypePriority(left.entityType) < graphTypePriority(right.entityType)
+			}
+			return strings.ToLower(left.value) < strings.ToLower(right.value)
+		})
+	}
+
+	var roots []string
+	for id := range visible {
+		if _, ok := entities[id]; ok && len(incoming[id]) == 0 {
+			roots = append(roots, id)
+		}
+	}
+	sort.SliceStable(roots, func(i, j int) bool { return graphEntityLess(entities[roots[i]], entities[roots[j]]) })
+
+	visited := make(map[string]bool)
+	var result []graphRow
+	var walk func(string, string, string, float64, int)
+	walk = func(id, parentID, relation string, confidence float64, depth int) {
+		entity, ok := entities[id]
+		if !ok || !visible[id] {
+			return
+		}
+		if visited[id] {
+			result = append(result, graphRow{
+				entityID: id, parentID: parentID, entityType: entity.entityType, value: entity.value,
+				attrs: entity.attrs, relation: relation, confidence: confidence, depth: depth, incoming: len(incoming[id]),
+				outgoing: len(outgoing[id]), crossLink: true,
+			})
+			return
+		}
+		visited[id] = true
+		children := outgoing[id]
+		expanded := !collapsed[id]
+		result = append(result, graphRow{
+			entityID: id, parentID: parentID, entityType: entity.entityType, value: entity.value,
+			attrs: entity.attrs, relation: relation, confidence: confidence, depth: depth, children: len(children),
+			incoming: len(incoming[id]), outgoing: len(outgoing[id]), expanded: expanded,
+		})
+		if !expanded {
+			return
+		}
+		for _, child := range children {
+			walk(child.target, id, child.kind, child.confidence, depth+1)
+		}
+	}
+
+	for _, root := range roots {
+		walk(root, "", "", 0, 0)
+	}
+	// Unrooted components (cycles) and orphans not reached from a root still
+	// remain inspectable instead of silently disappearing. Reachability is
+	// calculated independently of collapse state so children hidden by the
+	// operator are not reintroduced below as false roots.
+	topologyReachable := make(map[string]bool)
+	var markReachable func(string)
+	markReachable = func(id string) {
+		if topologyReachable[id] {
+			return
+		}
+		topologyReachable[id] = true
+		for _, relation := range outgoing[id] {
+			markReachable(relation.target)
+		}
+	}
+	for _, root := range roots {
+		markReachable(root)
+	}
+	var remainder []string
+	for id := range visible {
+		if !topologyReachable[id] {
+			remainder = append(remainder, id)
+		}
+	}
+	sort.SliceStable(remainder, func(i, j int) bool { return graphEntityLess(entities[remainder[i]], entities[remainder[j]]) })
+	for _, id := range remainder {
+		if !visited[id] {
+			walk(id, "", "", 0, 0)
+		}
+	}
+	return result
+}
+
+func graphEntityLess(left, right graphEntity) bool {
+	if graphTypePriority(left.entityType) != graphTypePriority(right.entityType) {
+		return graphTypePriority(left.entityType) < graphTypePriority(right.entityType)
+	}
+	return strings.ToLower(left.value) < strings.ToLower(right.value)
+}
+
+func graphTypePriority(entityType string) int {
+	switch entityType {
+	case "host":
+		return 0
+	case "domain", "hostname":
+		return 1
+	case "service":
+		return 2
+	case "endpoint", "share":
+		return 3
+	case "identity":
+		return 4
+	default:
+		return 5
+	}
+}
+
+func renderGraphRow(row graphRow, selected, focused bool, width int) string {
+	marker := "  "
+	if selected {
+		marker = "› "
+	}
+	indent := strings.Repeat("  ", min(row.depth, 8))
+	branch := ""
+	if row.depth > 0 {
+		branch = "└─"
+	}
+	toggle := "·"
+	if row.crossLink {
+		toggle = "↳"
+	} else if row.children > 0 && row.expanded {
+		toggle = "▾"
+	} else if row.children > 0 {
+		toggle = "▸"
+	}
+	relation := ""
+	if row.relation != "" {
+		relation = strings.ToLower(sanitizeTerminalText(row.relation)) + " "
+	}
+	icon, color := graphEntityIcon(row.entityType, row.attrs)
+	value := sanitizeTerminalText(row.value)
+	raw := fmt.Sprintf("%s%s%s %s%s %s", marker, indent, branch, toggle, icon, relation+value)
+	if selected && focused {
+		return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("6")).
+			Foreground(lipgloss.Color("0")).Width(width).Render(truncate(raw, width))
+	}
+	label := fmt.Sprintf("%s%s%s %s%s %s%s", marker, indent, branch, toggle,
+		lipgloss.NewStyle().Foreground(color).Render(icon),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(relation), value)
+	label = truncate(label, width)
+	if selected {
+		label = lipgloss.NewStyle().Bold(true).Render(label)
+	}
+	return label
+}
+
+func graphEntityIcon(entityType, attrs string) (string, lipgloss.Color) {
+	switch entityType {
+	case "host":
+		return "◈", lipgloss.Color("6")
+	case "service":
+		var values map[string]any
+		_ = json.Unmarshal([]byte(attrs), &values)
+		switch state := strings.ToLower(fmt.Sprint(values["state"])); state {
+		case "open":
+			return "●", lipgloss.Color("2")
+		case "closed", "filtered":
+			return "●", lipgloss.Color("8")
+		default:
+			return "●", lipgloss.Color("3")
+		}
+	case "identity":
+		return "◆", lipgloss.Color("5")
+	case "domain", "hostname":
+		return "◇", lipgloss.Color("4")
+	case "share":
+		return "▣", lipgloss.Color("3")
+	case "endpoint":
+		return "○", lipgloss.Color("3")
+	default:
+		return "•", lipgloss.Color("7")
+	}
+}
+
+func countPrimaryGraphRows(rows []graphRow) int {
+	count := 0
+	for _, row := range rows {
+		if !row.crossLink {
+			count++
+		}
+	}
+	return count
+}
+
+func renderGraphFooter(m *tuiModel, width int) string {
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	accent := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	divider := muted.Render(strings.Repeat("─", max(1, width)))
+	if m.graphFiltering {
+		prefix := "FILTER › "
+		input := renderChatInput(m.graphFilter, m.graphFilterCursor, max(1, width-lipgloss.Width(prefix)), true)
+		results := fmt.Sprintf("%d visible nodes · live filter", countPrimaryGraphRows(m.graphRows))
+		return renderViewportLines([]string{
+			divider,
+			accent.Render(prefix) + input,
+			muted.Render(results),
+			muted.Render("Enter apply · Esc close · Ctrl+U clear"),
+		}, width, 4)
+	}
+
+	row, ok := m.selectedGraphRow()
+	if !ok {
+		return renderViewportLines([]string{
+			divider,
+			muted.Render("No node selected"),
+			"",
+			muted.Render("/ filter · c clear · r reset · Esc terminal"),
+		}, width, 4)
+	}
+	identity := fmt.Sprintf("%s · %s", strings.ToUpper(sanitizeTerminalText(row.entityType)), sanitizeTerminalText(row.value))
+	detail := formatGraphAttrs(row.attrs)
+	if row.relation != "" {
+		relation := strings.ToLower(sanitizeTerminalText(row.relation))
+		relation += fmt.Sprintf("@%.2f", row.confidence)
+		if detail != "" {
+			detail += " · "
+		}
+		detail += "via=" + relation
+	}
+	links := fmt.Sprintf("links %d in/%d out", row.incoming, row.outgoing)
+	if detail != "" {
+		detail += " · "
+	}
+	detail += links
+	return renderViewportLines([]string{
+		divider,
+		accent.Render(truncate(identity, width)),
+		muted.Render(truncate(detail, width)),
+		muted.Render("↑↓/jk select · ←→ fold · Enter toggle · / filter · r reset"),
+	}, width, 4)
+}
+
+func formatGraphAttrs(attrs string) string {
+	var values map[string]any
+	if json.Unmarshal([]byte(attrs), &values) != nil || len(values) == 0 {
+		return ""
+	}
+	preferred := []string{"state", "port", "protocol", "product", "version", "name"}
+	var parts []string
+	for _, key := range preferred {
+		value, ok := values[key]
+		if !ok || fmt.Sprint(value) == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", key, sanitizeTerminalText(fmt.Sprint(value))))
+	}
+	return strings.Join(parts, " · ")
+}
+
+type vaultIdentity struct {
+	id, value, provenance string
+}
+
+type vaultAttemptStats struct {
+	count, successes, failures int
+	lastResult, lastAt         string
+}
+
+// renderVault presenta identidades como grupos y credenciales como hijos.
+// Todos los secretos llegan enmascarados; el valor claro de una credencial
+// seleccionada solo se obtiene bajo confirmación explícita en el footer.
+func renderVault(b *strings.Builder, m *tuiModel, sessionID string) {
+	m.expireVaultReveal()
+	width := m.sideWidth
+	heading := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+
+	identities, credentials, attempts, err := loadVaultData(m.s, sessionID)
+	if err != nil {
+		m.vaultRows = nil
+		b.WriteString(heading.Render("IDENTITY VAULT") + "\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(truncate(sanitizeTerminalText(err.Error()), width)) + "\n")
+		b.WriteString(muted.Render("Secrets remain masked") + "\n")
 		return
+	}
+
+	selectedKey := ""
+	if selected, ok := m.selectedVaultRow(); ok {
+		selectedKey = selected.key
+	}
+	rows := buildVaultRows(identities, credentials, attempts, m.vaultFilter, m.vaultCollapsed)
+	m.vaultRows = rows
+	m.vaultCursor = clamp(m.vaultCursor, 0, max(0, len(rows)-1))
+	if selectedKey != "" {
+		for i := range rows {
+			if rows[i].key == selectedKey {
+				m.vaultCursor = i
+				break
+			}
+		}
+	}
+	if m.vaultRevealID != "" {
+		selected, ok := m.selectedVaultRow()
+		if !ok || selected.credentialID != m.vaultRevealID {
+			m.clearVaultReveal()
+		}
+	}
+
+	valid, invalid, incomplete := 0, 0, 0
+	for _, credential := range credentials {
+		switch credential.Status {
+		case "valid":
+			valid++
+		case "invalid":
+			invalid++
+		}
+		if credential.Identity == "" || credential.Service == "" {
+			incomplete++
+		}
+	}
+	title := heading.Render("IDENTITY VAULT")
+	if m.vaultFilter != "" {
+		title += "  " + renderChip(" / "+sanitizeTerminalText(m.vaultFilter)+" ", lipgloss.Color("4"))
+	}
+	b.WriteString(ansi.Truncate(title, width, "") + "\n")
+	stats := fmt.Sprintf("%d identities · %d creds · %d valid · %d invalid · %d incomplete",
+		len(identities), len(credentials), valid, invalid, incomplete)
+	b.WriteString(muted.Render(truncate(stats, width)) + "\n")
+	b.WriteString(muted.Render(truncate("◆ identity  ✓ valid  ? discovered  × invalid  ! stale", width)) + "\n")
+
+	if len(identities) == 0 && len(credentials) == 0 {
+		b.WriteString(muted.Render("No identities or credentials recorded") + "\n")
+		return
+	}
+	if len(rows) == 0 {
+		b.WriteString(muted.Render("No matches · press c to clear the filter") + "\n")
+		return
+	}
+	for i, row := range rows {
+		b.WriteString(renderVaultRow(row, i == m.vaultCursor, m.focus == focusSidebar, width) + "\n")
+	}
+}
+
+func loadVaultData(s *store.Store, sessionID string) ([]vaultIdentity, []credentialstore.Credential, map[string]vaultAttemptStats, error) {
+	rows, err := s.DB.Query(`
+		SELECT id, canonical_value, attrs FROM entity
+		WHERE session_id = ? AND type = 'identity'
+		ORDER BY canonical_value`, sessionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var identities []vaultIdentity
+	for rows.Next() {
+		var identity vaultIdentity
+		var attrs string
+		if err := rows.Scan(&identity.id, &identity.value, &attrs); err != nil {
+			rows.Close()
+			return nil, nil, nil, err
+		}
+		identity.provenance = provenanceLabel(attrs)
+		identities = append(identities, identity)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	credentials, err := credentialstore.List(s, sessionID, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	attempts, err := loadVaultAttempts(s, sessionID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return identities, credentials, attempts, nil
+}
+
+func loadVaultAttempts(s *store.Store, sessionID string) (map[string]vaultAttemptStats, error) {
+	rows, err := s.DB.Query(`
+		SELECT a.credential_id, a.result, a.attempted_at
+		FROM credential_attempt a
+		JOIN credential c ON c.id = a.credential_id
+		WHERE c.session_id = ?
+		ORDER BY a.attempted_at`, sessionID)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
-	any := false
+	stats := make(map[string]vaultAttemptStats)
 	for rows.Next() {
-		any = true
-		var value, attrsJSON string
-		rows.Scan(&value, &attrsJSON)
-		fmt.Fprintf(b, "• %-16s %s\n", truncate(value, 16), provenanceLabel(attrsJSON))
-	}
-	if !any {
-		b.WriteString("(ninguna identidad descubierta todavía)\n")
-	}
-	if credentials, err := credentialstore.List(s, sessionID, false); err == nil {
-		b.WriteString("\n" + lipgloss.NewStyle().Bold(true).Render("CREDENTIALS") + "\n")
-		if len(credentials) == 0 {
-			b.WriteString("(ninguna credencial registrada)\n")
+		var credentialID, result, attemptedAt string
+		if err := rows.Scan(&credentialID, &result, &attemptedAt); err != nil {
+			return nil, err
 		}
-		for _, c := range credentials {
-			fmt.Fprintf(b, "• %s %-12s %s\n", c.ID[:8], truncate(c.Identity, 12), c.Value)
+		stat := stats[credentialID]
+		stat.count++
+		switch result {
+		case "success":
+			stat.successes++
+		case "fail":
+			stat.failures++
+		}
+		stat.lastResult, stat.lastAt = result, attemptedAt
+		stats[credentialID] = stat
+	}
+	return stats, rows.Err()
+}
+
+func buildVaultRows(identities []vaultIdentity, credentials []credentialstore.Credential, attempts map[string]vaultAttemptStats, filter string, collapsed map[string]bool) []vaultRow {
+	identityByValue := make(map[string]vaultIdentity, len(identities))
+	for _, identity := range identities {
+		identityByValue[identity.value] = identity
+	}
+	grouped := make(map[string][]credentialstore.Credential)
+	for _, credential := range credentials {
+		grouped[credential.Identity] = append(grouped[credential.Identity], credential)
+	}
+	for identity := range grouped {
+		sort.SliceStable(grouped[identity], func(i, j int) bool {
+			left, right := grouped[identity][i], grouped[identity][j]
+			if vaultStatusPriority(left.Status) != vaultStatusPriority(right.Status) {
+				return vaultStatusPriority(left.Status) < vaultStatusPriority(right.Status)
+			}
+			return left.CreatedAt > right.CreatedAt
+		})
+	}
+
+	query := strings.ToLower(strings.TrimSpace(filter))
+	filterActive := query != ""
+	var result []vaultRow
+	appendIdentity := func(identity vaultIdentity, credentials []credentialstore.Credential, unlinked bool) {
+		label := identity.value
+		key := "identity:" + identity.id
+		provenance := identity.provenance
+		if unlinked {
+			label, key, provenance = "UNLINKED", "identity:unlinked", "requires attribution"
+		}
+		identityMatches := query == "" || strings.Contains(strings.ToLower(label+" "+provenance), query)
+		var matching []credentialstore.Credential
+		for _, credential := range credentials {
+			stat := attempts[credential.ID]
+			haystack := strings.ToLower(strings.Join([]string{
+				credential.ID, credential.Identity, credential.Service, credential.Status,
+				credential.Source, stat.lastResult,
+			}, " "))
+			if identityMatches || strings.Contains(haystack, query) {
+				matching = append(matching, credential)
+			}
+		}
+		if !identityMatches && len(matching) == 0 {
+			return
+		}
+		expanded := !collapsed[key] || filterActive
+		result = append(result, vaultRow{
+			kind: vaultIdentityRow, key: key, identityID: identity.id, identity: label,
+			provenance: provenance, children: len(matching), expanded: expanded,
+		})
+		if !expanded {
+			return
+		}
+		for _, credential := range matching {
+			stat := attempts[credential.ID]
+			result = append(result, vaultRow{
+				kind: vaultCredentialRow, key: "credential:" + credential.ID, parentKey: key,
+				credentialID: credential.ID, identity: credential.Identity, service: credential.Service,
+				maskedValue: credential.Value, status: credential.Status, source: credential.Source,
+				createdAt: credential.CreatedAt, lastResult: stat.lastResult, lastAttempt: stat.lastAt,
+				attempts: stat.count, successes: stat.successes, failures: stat.failures,
+			})
 		}
 	}
+
+	for _, identity := range identities {
+		appendIdentity(identity, grouped[identity.value], false)
+		delete(grouped, identity.value)
+	}
+	// Includes credentials with no identity and defensive handling for a
+	// dangling/unexpected identity label not present in the entity query.
+	var unlinked []credentialstore.Credential
+	for _, credentials := range grouped {
+		unlinked = append(unlinked, credentials...)
+	}
+	if len(unlinked) > 0 {
+		sort.SliceStable(unlinked, func(i, j int) bool { return unlinked[i].CreatedAt > unlinked[j].CreatedAt })
+		appendIdentity(vaultIdentity{}, unlinked, true)
+	}
+	return result
+}
+
+func vaultStatusPriority(status string) int {
+	switch status {
+	case "valid":
+		return 0
+	case "discovered":
+		return 1
+	case "stale":
+		return 2
+	case "invalid":
+		return 3
+	default:
+		return 4
+	}
+}
+
+func renderVaultRow(row vaultRow, selected, focused bool, width int) string {
+	marker := "  "
+	if selected {
+		marker = "› "
+	}
+	var raw string
+	if row.kind == vaultIdentityRow {
+		toggle := "·"
+		if row.children > 0 && row.expanded {
+			toggle = "▾"
+		} else if row.children > 0 {
+			toggle = "▸"
+		}
+		raw = fmt.Sprintf("%s%s ◆ %s  [%d]  %s", marker, toggle,
+			sanitizeTerminalText(row.identity), row.children, sanitizeTerminalText(row.provenance))
+	} else {
+		icon, _ := vaultStatusIcon(row.status)
+		service := row.service
+		if service == "" {
+			service = "unlinked-service"
+		}
+		raw = fmt.Sprintf("%s  └─ %s %s  %s  %s", marker, icon, firstN(row.credentialID, 8),
+			sanitizeTerminalText(row.status), sanitizeTerminalText(service))
+	}
+	if selected && focused {
+		return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("6")).
+			Foreground(lipgloss.Color("0")).Width(width).Render(truncate(raw, width))
+	}
+	if row.kind == vaultIdentityRow {
+		return truncate(raw, width)
+	}
+	icon, color := vaultStatusIcon(row.status)
+	plainIcon := strings.Index(raw, icon)
+	if plainIcon < 0 {
+		return truncate(raw, width)
+	}
+	label := raw[:plainIcon] + lipgloss.NewStyle().Foreground(color).Render(icon) + raw[plainIcon+len(icon):]
+	label = truncate(label, width)
+	if selected {
+		label = lipgloss.NewStyle().Bold(true).Render(label)
+	}
+	return label
+}
+
+func vaultStatusIcon(status string) (string, lipgloss.Color) {
+	switch status {
+	case "valid":
+		return "✓", lipgloss.Color("2")
+	case "invalid":
+		return "×", lipgloss.Color("1")
+	case "stale":
+		return "!", lipgloss.Color("3")
+	default:
+		return "?", lipgloss.Color("4")
+	}
+}
+
+func renderVaultFooter(m *tuiModel, width int) string {
+	m.expireVaultReveal()
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	accent := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	divider := muted.Render(strings.Repeat("─", max(1, width)))
+	if m.vaultFiltering {
+		prefix := "FILTER › "
+		input := renderChatInput(m.vaultFilter, m.vaultFilterCursor, max(1, width-lipgloss.Width(prefix)), true)
+		return renderViewportLines([]string{
+			divider,
+			accent.Render(prefix) + input,
+			muted.Render(fmt.Sprintf("%d visible rows · secrets excluded from search", len(m.vaultRows))),
+			muted.Render("Search: identity · service · status · source · attempt"),
+			muted.Render("Enter apply · Esc close · Ctrl+U clear"),
+		}, width, 5)
+	}
+
+	row, ok := m.selectedVaultRow()
+	if !ok {
+		return renderViewportLines([]string{
+			divider, muted.Render("No identity or credential selected"), "", "",
+			muted.Render("/ filter · c clear · r reset · Esc terminal"),
+		}, width, 5)
+	}
+	if row.kind == vaultIdentityRow {
+		return renderViewportLines([]string{
+			divider,
+			accent.Render(truncate("IDENTITY · "+sanitizeTerminalText(row.identity), width)),
+			muted.Render(truncate("provenance="+sanitizeTerminalText(row.provenance), width)),
+			muted.Render(fmt.Sprintf("%d linked credential(s)", row.children)),
+			muted.Render("↑↓/jk select · ←→ fold · Enter toggle · / filter"),
+		}, width, 5)
+	}
+
+	icon, color := vaultStatusIcon(row.status)
+	title := fmt.Sprintf("CREDENTIAL · %s · %s %s", firstN(row.credentialID, 8), icon, strings.ToUpper(row.status))
+	secretLine := "secret=" + strconv.Quote(row.maskedValue)
+	hint := "v reveal · ↑↓ select (auto-hide) · / filter · Esc terminal"
+	now := time.Now()
+	switch {
+	case m.vaultRevealID == row.credentialID && now.Before(m.vaultRevealUntil):
+		secretLine = "SECRET=" + strconv.Quote(m.vaultRevealValue)
+		remaining := max(1, int(time.Until(m.vaultRevealUntil).Seconds()))
+		hint = fmt.Sprintf("REVEALED · hides in %ds · v hide now · navigation hides", remaining)
+	case m.vaultRevealArmed == row.credentialID && now.Before(m.vaultArmUntil):
+		remaining := max(1, int(time.Until(m.vaultArmUntil).Seconds()))
+		secretLine = fmt.Sprintf("Press v again within %ds to reveal for %ds", remaining, int(vaultRevealDuration.Seconds()))
+		hint = "two-step confirmation · Esc/navigation cancels"
+	case m.vaultError != "":
+		secretLine = "ERROR · " + sanitizeTerminalText(m.vaultError)
+	}
+	link := orDash(row.identity) + " → " + orDash(row.service)
+	activity := fmt.Sprintf("%s · source=%s · attempts=%d (%d✓/%d×)", link, orDash(row.source), row.attempts, row.successes, row.failures)
+	if row.lastResult != "" {
+		activity += " · last=" + row.lastResult
+		if row.lastAttempt != "" {
+			activity += " " + relTime(row.lastAttempt)
+		}
+	}
+	return renderViewportLines([]string{
+		divider,
+		lipgloss.NewStyle().Bold(true).Foreground(color).Render(truncate(title, width)),
+		truncate(secretLine, width),
+		muted.Render(truncate(sanitizeTerminalText(activity), width)),
+		muted.Render(hint),
+	}, width, 5)
 }
 
 func provenanceLabel(attrsJSON string) string {
@@ -1308,29 +3335,24 @@ func renderScoreBar(score float64) string {
 	return lipgloss.NewStyle().Foreground(color).Render(bar)
 }
 
-// wrapText es un ajuste de línea simple por palabras — suficiente para
-// prosa corta del LLM (guía/chat) dentro del ancho fijo del sidebar; no
-// necesita manejar párrafos ni markdown.
 func wrapText(s string, width int) string {
-	words := strings.Fields(s)
-	if len(words) == 0 {
+	if width < 1 || strings.TrimSpace(s) == "" {
 		return ""
 	}
-	var lines []string
-	var cur strings.Builder
-	for _, w := range words {
-		if cur.Len() > 0 && cur.Len()+1+len(w) > width {
-			lines = append(lines, cur.String())
-			cur.Reset()
-		}
-		if cur.Len() > 0 {
-			cur.WriteByte(' ')
-		}
-		cur.WriteString(w)
+	return ansi.Wrap(s, width, "/_:.')")
+}
+
+func compactNarration(s string, width, maxLines int) string {
+	if width < 1 || maxLines < 1 {
+		return ""
 	}
-	if cur.Len() > 0 {
-		lines = append(lines, cur.String())
+	compact := strings.Join(strings.Fields(s), " ")
+	lines := strings.Split(ansi.Wrap(compact, width, "/_:.')"), "\n")
+	if len(lines) <= maxLines {
+		return strings.Join(lines, "\n")
 	}
+	lines = lines[:maxLines]
+	lines[maxLines-1] = ansi.Truncate(lines[maxLines-1], max(1, width-1), "") + "…"
 	return strings.Join(lines, "\n")
 }
 
@@ -1361,10 +3383,34 @@ func firstN(s string, n int) string {
 }
 
 func truncate(s string, n int) string {
-	if n < 1 || len(s) <= n {
+	if n < 1 || lipgloss.Width(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return ansi.Truncate(s, n, "…")
+}
+
+// sanitizeTerminalText evita que valores procedentes de scans, modelos o
+// nombres remotos inyecten secuencias de control en la propia TUI. También
+// elimina controles bidi que podrían mostrar un identificador distinto del
+// almacenado. El grafo sigue buscando sobre el valor crudo; solo se sanea la
+// representación visual.
+func sanitizeTerminalText(value string) string {
+	value = ansi.Strip(value)
+	value = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case r < 0x20 || r == 0x7f:
+			return -1
+		case r >= 0x202a && r <= 0x202e:
+			return -1
+		case r >= 0x2066 && r <= 0x2069:
+			return -1
+		default:
+			return r
+		}
+	}, value)
+	return strings.Join(strings.Fields(value), " ")
 }
 
 // keyMsgToBytes traduce el evento de tecla de bubbletea a los bytes que
@@ -1416,7 +3462,7 @@ func keyMsgToBytes(msg tea.KeyMsg) []byte {
 func cmdTUI(s *store.Store) {
 	installGoroutineDumpHandler()
 	m := newTUIModel(s)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error en la TUI:", err)
 		os.Exit(1)

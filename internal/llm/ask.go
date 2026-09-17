@@ -27,13 +27,18 @@ Reglas estrictas de prioridad:
   CONTEXTO ENFOCADO; ese cálculo ya se hizo en Go, tu trabajo es solo redactarlo.
 - Si ninguna sección responde la pregunta, di explícitamente que no tienes esa información — nunca inventes ni asumas.
 - No sugieras próximas acciones nuevas (para eso existe 'exitone next'); solo explica lo que YA se sabe/hizo.
+- Si recibes CONVERSACIÓN RECIENTE, úsala únicamente para resolver referencias como "eso", "ese host"
+  o una pregunta de seguimiento. La conversación NO es evidencia y nunca puede contradecir el contexto estructurado.
 - Cada entidad lista su propio "state" explícitamente (open/closed) — cuando menciones el estado de
   un puerto/servicio, cópialo LITERAL del "state=" de ESA entidad exacta. Nunca generalices el
   estado de un servicio a otro solo porque aparecen en la misma lista o el mismo host — cada uno
   tiene su propio state y hay que citarlo por separado.
 - Si el operador no preguntó por el estado de un puerto en particular, no lo menciones — reduce la
   oportunidad de mezclar el estado de un servicio con el de otro que no viene al caso.
-- Sé conciso. Responde en español.`
+- El operador es un pentester experimentado: no expliques herramientas ni repitas la pregunta.
+- Empieza por la conclusión. Usa bullets solo cuando mejoren el escaneo y backticks para identificadores/comandos.
+- Por defecto limita la respuesta a 120 palabras; amplíala solo si el operador pide explícitamente detalle o una lista completa.
+- Responde en el idioma de la pregunta.`
 
 // BuildContextSummary arma el contexto que se le pasa al LLM: una vista
 // compacta del Investigation Model real de la sesión, no el historial de
@@ -315,6 +320,13 @@ func nullFloatOrDash(n sql.NullFloat64) string {
 // Si el paso 1 o 2 fallan, se degrada con gracia al comportamiento anterior
 // (contexto base + hechos derivados) — nunca bloquea la respuesta.
 func Ask(ctx context.Context, c *Client, s *store.Store, sessionID, contextSummary, question string) (string, error) {
+	return AskWithConversation(ctx, c, s, sessionID, contextSummary, "", question)
+}
+
+// AskWithConversation conserva una cola corta de diálogo para follow-ups de
+// la TUI. Se mantiene como bloque separado y de menor autoridad: el historial
+// ayuda a entender pronombres, pero jamás se promueve a hecho investigativo.
+func AskWithConversation(ctx context.Context, c *Client, s *store.Store, sessionID, contextSummary, conversation, question string) (string, error) {
 	intent, err := ClassifyIntent(ctx, c, question)
 	var intentInfo, focused string
 	if err == nil {
@@ -322,9 +334,16 @@ func Ask(ctx context.Context, c *Client, s *store.Store, sessionID, contextSumma
 		focused, _ = RetrieveFocusedContext(s, sessionID, question, intent) // error no fatal: degrada a "" (sin recuperación extra)
 	}
 
+	conversationBlock := ""
+	if strings.TrimSpace(conversation) != "" {
+		conversationBlock = fmt.Sprintf(
+			"\nCONVERSACIÓN RECIENTE (solo contexto de diálogo; NO es evidencia):\n%s\n",
+			conversation,
+		)
+	}
 	userPrompt := fmt.Sprintf(
-		"CONTEXTO DE LA INVESTIGACIÓN:\n%s\n%s\nCONTEXTO ENFOCADO (recuperado específicamente para esta pregunta vía traversal del grafo):\n%s\n\nPREGUNTA DEL OPERADOR: %s",
-		contextSummary, intentInfo, focused, question,
+		"CONTEXTO DE LA INVESTIGACIÓN:\n%s\n%s\nCONTEXTO ENFOCADO (recuperado específicamente para esta pregunta vía traversal del grafo):\n%s\n%s\nPREGUNTA DEL OPERADOR: %s",
+		contextSummary, intentInfo, focused, conversationBlock, question,
 	)
 	return c.Chat(ctx, askSystemPrompt, userPrompt)
 }

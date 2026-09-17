@@ -171,42 +171,54 @@ Known sensitive flags such as `--password`, `--pass`, `--token`, `--secret`, and
 
 ### 2. TUI — live shell workflow
 
-`exitone start <target>` opens a single application with a real PTY-backed shell on the left and a live investigation sidebar on the right.
+`exitone start <target>` opens a single application with a real PTY-backed shell and a live investigation panel. Both panes start at 50/50, have independent vertical scrollbars, and can be resized by dragging the divider or with the keyboard.
 
 ```text
-┌──────────────────────────────── terminal ────────────────────────────────┬──────── ExitOne ────────┐
-│ kali@lab:~$ nmap ...                                                     │ target: 10.10.10.10     │
-│                                                                          │ [OVERVIEW]              │
-│                                                                          │ ETAPAS                  │
-│                                                                          │ surface_discovery ...   │
-│                                                                          │                         │
-│                                                                          │ SUGERENCIAS             │
-│                                                                          │ 0.90 [...] nmap ...     │
-│                                                                          │                         │
-│                                                                          │ OBJECTIVES ABIERTOS     │
-└──────────────────────────────────────────────────────────────────────────┴─────────────────────────┘
-  Ctrl+Space: suggestion · F2: view · Ctrl+P: pause · F1: help · Ctrl+Q: exit
+┌────────────────────── ▶ OPERATOR ──┐│┌────────────────── EXITONE ───────┐
+│ kali@lab:~$ nmap ...              █│││ Overview  Graph  Vault  Chat   █│
+│                                    │││ NEXT                             │
+│                                    │││ 0.90  NMAP · discovery/low       │
+│                                    │││ $ nmap -sV 10.10.10.10           │
+│                                    │││                                  │
+│                                    │││ STATE                            │
+│                                    │││ ✓ Discovery · sufficient         │
+│                                    │││ › Enumeration · active           │
+└────────────────────────────────────┘│└──────────────────────────────────┘
+  F2 vista · F3 foco · Alt+←/→ ancho · Pg↑/Pg↓ scroll · F1 ayuda
 ```
 
-The sidebar has three views:
+The investigation pane has four views, selectable with `F2` or by clicking their tabs. `OVERVIEW` is deliberately terse and assumes an experienced pentester: it puts the next command first, limits rationale to operational risk/context, and keeps secondary candidates and open paths scannable.
 
 | View | Purpose |
 | --- | --- |
 | **OVERVIEW** | Investigation stages, highest-ranked suggestions, and open objectives |
-| **GRAPH** | ASCII attack-surface view built from stored entity relationships |
-| **VAULT** | Discovered identities with provenance (`confirmed`, source-provided, or LLM-assisted) |
+| **GRAPH** | Interactive attack-surface explorer over every stored entity and active relationship |
+| **VAULT** | Interactive identity/credential explorer with provenance, attempt history, masked-by-default secrets, and controlled reveal |
+| **CHAT** | Session-grounded, read-only conversation with short follow-up context; chat history never becomes investigation evidence |
 
 Keyboard shortcuts:
 
 | Key | Action |
 | --- | --- |
 | <kbd>Ctrl</kbd>+<kbd>Space</kbd> | Insert the top-ranked command into the prompt — **never executes it** |
-| <kbd>F2</kbd> | Cycle `OVERVIEW → GRAPH → VAULT` |
+| <kbd>F2</kbd> | Cycle `OVERVIEW → GRAPH → VAULT → CHAT` |
+| <kbd>F3</kbd> | Move keyboard focus between the terminal and investigation pane |
+| <kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd> | Resize the panes; the center divider can also be dragged |
+| <kbd>PgUp</kbd>/<kbd>PgDn</kbd> | Scroll the focused pane; mouse wheel and scrollbar dragging are also supported |
+| <kbd>Ctrl</kbd>+<kbd>Home</kbd>/<kbd>End</kbd> | Jump to the beginning/end of the focused pane |
 | <kbd>Ctrl</kbd>+<kbd>P</kbd> | Pause/resume sidebar refresh |
 | <kbd>F1</kbd> | Contextual help |
 | <kbd>Ctrl</kbd>+<kbd>Q</kbd> | Exit the TUI |
 
-The embedded TUI now mirrors raw PTY bytes into its own stream file under `~/.exitone/streams/`. When the Zsh hooks are loaded, they use this stream to delimit each completed command and submit its output to the existing ingestion pipeline. tmux `pipe-pane` remains a fallback rather than the primary capture mechanism.
+In `CHAT`, the transcript scrolls independently while the composer remains fixed. `Enter` sends, `↑/↓` recalls questions, arrow/Home/End keys edit the current line, `Ctrl+W` deletes a word, `Ctrl+U` clears the draft, `Ctrl+C` cancels an in-flight query, `Ctrl+R` retries the latest failure, and `Ctrl+L` clears the in-memory transcript. `Esc` returns keyboard control to the terminal without hiding the conversation. Duplicate questions and late responses are correlated by request ID, so a cancelled or retried answer cannot overwrite the active turn.
+
+Only the last three successful turns are supplied as bounded dialogue context for follow-up references. This context is explicitly lower-trust than the structured session graph: it can clarify “that host” but cannot create or override evidence. Answers default to concise, conclusion-first language for an experienced pentester.
+
+In `GRAPH`, `↑/↓` or `j/k` moves across nodes, `←/→` or `h/l` collapses and expands branches, and `Enter` toggles the selected branch. `/` opens a live filter over entity type, canonical value, attributes, and relationship kind; ancestors and one-hop context stay visible so a match is not shown without provenance. `c` clears the filter and `r` resets the view. The fixed detail footer shows the selected entity's high-signal attributes and in/out degree. Cycles and repeated relationships render as cross-links instead of recursing forever, and clicking a row selects it. Remote labels are stripped of terminal and bidirectional-control sequences before rendering to prevent scan-derived terminal injection.
+
+In `VAULT`, identities group their linked credentials and credentials without an identity are isolated under `UNLINKED`; missing identity/service links are counted as incomplete. `↑/↓` or `j/k` navigates, `←/→` or `Enter` folds identity groups, and `/` filters by identity, service, status, source, or latest attempt — secret values are deliberately excluded from search. The fixed footer shows provenance, links, status, source, and success/failure counts. Secrets remain masked by default: press `v` twice within five seconds to reveal only the selected credential for ten seconds. Navigating, changing focus/view, opening help, or pressing `v` again hides it immediately. Control characters are rendered as escaped text rather than sent to the terminal.
+
+The active pane is identified by both a `▶` marker and color, so focus remains visible in monochrome terminals. The embedded TUI mirrors raw PTY bytes into its own stream file under `~/.exitone/streams/`. When the Zsh hooks are loaded, they use this stream to delimit each completed command and submit its output to the existing ingestion pipeline. tmux `pipe-pane` remains a fallback rather than the primary capture mechanism.
 
 ### 3. Read-only dashboard
 
@@ -312,7 +324,7 @@ source "$HOME/.zshrc"
 | Every completed command | A fingerprinted event is stored, including failures and commands without useful output; exact unique matches are linked automatically and ambiguous matches stay explicitly ambiguous |
 | Command writes an output file (`-o`, `-oG`, `-oX`, `--output`, `>`, etc.) | The file is automatically passed to `exitone ingest` after a successful command |
 | Zsh is running inside **tmux** and no output file exists | `tmux pipe-pane` captures the command output and submits the relevant slice in the background |
-| Embedded TUI without tmux and no output file exists | There is currently **no `pipe-pane` stream capture**; redirect/save the output or ingest it manually |
+| Embedded TUI without tmux and no output file exists | The PTY is mirrored to `~/.exitone/streams/tui<PID>.log`; the Zsh hook slices that stream and submits the completed command output |
 
 Shell event metadata includes command, working directory, timestamps, exit code, and pane information when available. That event can then be linked to the evidence generated from the command.
 
@@ -819,7 +831,7 @@ ExitOne is an active research prototype. Important current boundaries:
 1. **No autonomous execution.** ExitOne may reason across exploitation and post-access, but no component executes a candidate command.
 2. **Deterministic command coverage is still narrow.** Several methodology paths can be opened before a corresponding command template exists; conceptual candidates keep those gaps visible.
 3. **LLM output is low-trust by design.** Observations stay pending until human confirmation and exploratory candidate confidence is capped at `0.5`.
-4. **Full passive stdout capture currently requires tmux.** The Zsh hook uses `tmux pipe-pane`; the default embedded TUI does not yet stream arbitrary PTY output into ingestion when no output file exists.
+4. **Passive stdout capture depends on the provided Zsh hook.** The embedded TUI supplies its own PTY stream and tmux uses `pipe-pane`, but shells without the hook still require explicit output files or manual ingestion.
 5. **Ambiguity is preserved.** Multiple exact candidate matches are recorded as ambiguous and require `accept`, `resolve`, or `--for-action`; ExitOne does not choose one arbitrarily.
 6. **Credential encryption at rest is not implemented.** Values are local SQLite plaintext by explicit design and therefore require filesystem protection.
 7. **Shell hooks are Zsh-oriented.** Other shells can still use the CLI/TUI and manual ingestion, but do not get the provided hook workflow.
