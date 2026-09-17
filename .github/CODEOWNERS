@@ -1,0 +1,7 @@
+# Default owner for everything not matched below.
+*       @neavus-23
+
+# Anything touching CI, dependency policy, or the security posture of the
+# repo itself gets explicit attention, not just a rubber-stamp.
+/.github/               @neavus-23
+/SECURITY.md            @neavus-23
