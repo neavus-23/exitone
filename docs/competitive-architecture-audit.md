@@ -683,6 +683,373 @@ P-CONFIG is complete when an operator can manage ExitOne's supported configurati
 
 Configuration management remains separate from investigation evidence and must never provide a path for an LLM to execute shell commands or silently alter authoritative investigation state.
 
+
+## P-VAULT — Sensitive Knowledge and Credential State
+
+VAULT remains a first-class TUI surface. Its purpose is operational access to sensitive investigation knowledge; CONFIG governs the policies that control how that knowledge is handled.
+
+The separation is:
+
+CONFIG → SENSITIVE DATA POLICY → VAULT → INVESTIGATION STATE
+
+Do not turn Vault into another Settings screen.
+
+### Scope
+
+Vault should manage sensitive objects such as:
+
+- credentials;
+- identities and account relationships;
+- tokens;
+- cookies/session artifacts;
+- API keys;
+- certificates/private keys where appropriate;
+- discovered secrets;
+- sensitive evidence references.
+
+The current credential model already stores a secret, fingerprint, identity/service references, source reference and status. P-VAULT extends that model so status changes become provenance-bearing investigation events rather than unstructured metadata.
+
+### Credential and identity state
+
+Credential state must distinguish discovery from validation and compromise.
+
+Recommended lifecycle:
+
+DISCOVERED → EXPOSED → VALIDATED → COMPROMISED
+
+Alternate states include INVALID, REVOKED, STALE and UNKNOWN.
+
+| State | Meaning |
+|---|---|
+| DISCOVERED | A credential was identified in evidence, but its usability is unknown. |
+| EXPOSED | The secret was exposed through an observed source. |
+| VALIDATED | The credential was successfully validated for an allowed service/context. |
+| COMPROMISED | Evidence demonstrates authenticated access using the credential. |
+| INVALID | Evidence demonstrates that the credential does not work for the tested service/context. |
+| REVOKED | Evidence demonstrates that the credential has been revoked or disabled. |
+| STALE | The credential may have been valid previously but is no longer treated as current. |
+| UNKNOWN | Available evidence is insufficient to establish a stronger state. |
+
+The implementation must not require every credential to pass through every state.
+
+### State transitions require provenance
+
+Every authoritative state transition should be represented explicitly:
+
+credential_status_transition
+- credential_id
+- from_status
+- to_status
+- actor
+- source_type
+- source_id
+- reason
+- confidence
+- timestamp
+
+Possible source types:
+
+- MANUAL
+- EVIDENCE
+- ACTION_OUTCOME
+- LLM_SUGGESTION
+- SYSTEM
+
+Critical invariant:
+
+> LLM_SUGGESTION may propose a transition, but must never silently become an authoritative credential state.
+
+### Human confirmation boundary
+
+Example:
+
+Potential state update
+
+Credential: j.smith / password  
+Evidence: SSH authentication succeeded  
+Suggested state: COMPROMISED  
+Confidence: 0.97
+
+[Mark compromised] [Dismiss]
+
+The operator explicitly confirms the transition.
+
+This preserves ExitOne's existing boundary:
+
+LLM → proposes  
+Human → decides  
+ExitOne → records
+
+Automated evidence processing may create a proposed transition, but authoritative state mutation must follow the configured policy and remain auditable.
+
+### Reveal
+
+Reveal is an explicit Vault operation for temporarily displaying a secret.
+
+Rules:
+
+- it must never change credential compromise state;
+- it should create a secret_revealed audit event;
+- the revealed value must remain excluded from ordinary logs and reports;
+- prompts should receive masked values by default;
+- Reveal should be subject to the configured sensitive-data policy;
+- the operator should be able to trace when and why a secret was revealed without storing the secret itself in the audit record.
+
+Therefore:
+
+REVEAL ≠ VALIDATE ≠ COMPROMISE
+
+### Mark compromised
+
+The operator should be able to manually mark a credential as compromised when engagement evidence supports that conclusion.
+
+The transition must record previous state, new state, operator/session, timestamp, reason, supporting evidence/action/outcome reference and confidence where applicable.
+
+Example:
+
+DISCOVERED
+  ↓
+MARK COMPROMISED
+  ↓
+CredentialStatusChanged
+  previous = discovered
+  new = compromised
+  actor = operator
+  source = manual
+  reason = "Successful authenticated access"
+  evidence = EVD-0312
+
+### Evidence-driven proposal
+
+ExitOne should also detect when an action outcome provides strong evidence for a state transition.
+
+Authentication action
+  ↓
+successful authentication
+  ↓
+ActionOutcome
+  ↓
+proposed credential transition
+  ↓
+operator confirmation
+  ↓
+COMPROMISED
+
+This should be implemented as a deterministic evidence-to-proposal rule before relying on an LLM to infer the transition. The LLM can then explain the proposal, identify supporting evidence, or point out contradictions.
+
+### Identity state
+
+Identity and credential state should remain related but not conflated.
+
+Example:
+
+Identity: j.smith
+- password → COMPROMISED
+- SSH key → DISCOVERED
+- API token → REVOKED
+
+Do not automatically mark an entire identity COMPROMISED merely because one credential is compromised. Identity-level status should be defined separately and backed by relevant evidence.
+
+### Investigation Graph integration
+
+Credential state changes should create or update graph relationships:
+
+Identity j.smith
+  ├── HAS_CREDENTIAL → password
+  ├── DISCOVERED_BY → Evidence EVD-0182
+  ├── VALIDATED_BY → SSH authentication
+  └── GRANTS_ACCESS_TO → Host 10.10.10.25
+
+This makes Vault state useful to Strategy, Hypotheses and Reporting rather than treating Vault as isolated storage.
+
+### Hypothesis reopening
+
+Credential state changes must participate in ExitOne's temporal investigation model.
+
+Example:
+
+Hypothesis H-021: "SSH does not provide a viable access path."
+Status: REFUTED / CLOSED
+
+Later:
+j.smith credential discovered
+  ↓
+credential validated
+  ↓
+SSH authentication succeeds
+  ↓
+H-021 becomes stale/incomplete
+  ↓
+REOPEN / REPLAN
+
+Reopening should be structural: the new observation/action outcome changes an assumption or contradicts the prior conclusion. Do not reopen hypotheses merely because a credential entity of some type appeared.
+
+### Strategy integration
+
+Credential state becomes a context feature for candidate generation.
+
+j.smith password = COMPROMISED  
+SSH service = exposed  
+Previous SSH test = admin failed  
+  ↓
+Context Resolver
+  ↓
+Strategy
+  ↓
+identity-specific authentication coverage
+
+Candidate basis should retain the credential/identity state references that caused the candidate to become relevant.
+
+### Report integration
+
+Reports should consume authoritative Vault state without exposing secrets.
+
+Example:
+
+Compromised identities
+
+j.smith
+- Credential type: Password
+- Validation: SSH
+- Target: 10.10.10.25
+- Evidence: EVD-0312
+- Status: Compromised
+
+A report statement should be traceable:
+
+Finding → Credential → Identity → Evidence → Action → Outcome
+
+The report must distinguish credential discovered, exposed, validated, authenticated access demonstrated, invalid/revoked/stale and unresolved states.
+
+Secrets remain masked unless the engagement/report policy explicitly defines otherwise.
+
+### LLM exposure policy
+
+The LLM should normally receive credential metadata, not secret values.
+
+Allowed by default:
+- identity = j.smith
+- credential_type = password
+- status = compromised
+- service = ssh
+- evidence = EVD-0312
+
+Denied by default:
+- password = <secret>
+- token = <secret>
+- cookie = <secret>
+
+A capability-specific policy may permit controlled secret access for a future workflow, but that must be explicit and auditable.
+
+### Vault UI
+
+Recommended actions:
+
+VAULT
+────────────────────────────────
+j.smith
+Password
+Status: COMPROMISED
+Source: EVD-0182
+
+[R] Reveal
+[M] Mark compromised
+[V] Validate
+[I] Mark invalid
+[T] Trace
+[H] History
+
+The UI should show status, confidence, source, related identity/service, supporting evidence, last validation, state history and provenance. The secret remains masked.
+
+### State history
+
+Do not overwrite status without preserving history.
+
+Example:
+
+j.smith / password
+
+10:32  DISCOVERED
+       source: smb output
+
+10:41  VALIDATED
+       source: SSH authentication
+       evidence: EVD-0312
+
+10:41  COMPROMISED
+       actor: operator
+       reason: authenticated access demonstrated
+
+11:55  STALE
+       source: credential validation
+       evidence: EVD-0441
+
+This temporal history is important for report reproducibility and for understanding why a strategy was valid at a particular point in the engagement.
+
+### Security invariants
+
+1. Reveal never implies compromise.
+2. Discovery never implies validity.
+3. LLM suggestion never silently becomes authoritative state.
+4. Every authoritative state transition has provenance.
+5. Credential state changes can affect hypotheses and strategy only through traceable investigation state.
+6. Reports consume Vault state but never require raw secrets.
+7. Raw secrets remain masked in normal LLM context, logs, telemetry and exports.
+8. A later state change must not erase the historical state that influenced an earlier decision.
+
+### Schema direction
+
+The current credential.status field should evolve from a simple mutable status into a current-state projection backed by transition history.
+
+Conceptual model:
+
+credential
+  - current_status
+  - secret_fingerprint
+  - identity_entity_id
+  - service_entity_id
+  - source_ref
+
+credential_status_transition
+  - credential_id
+  - from_status
+  - to_status
+  - actor
+  - source_type
+  - source_id
+  - reason
+  - confidence
+  - created_at
+
+Existing credential_attempt remains useful as service-validation history, while status transitions provide the authoritative lifecycle audit.
+
+### P-VAULT priority
+
+1. State model and transition history
+2. Manual Reveal / Mark compromised / Mark invalid
+3. Deterministic evidence-driven transition proposals
+4. Identity/credential graph integration
+5. Hypothesis reopening integration
+6. Strategy/context integration
+7. Report integration
+8. Capability-specific LLM exposure policy
+9. Vault history and advanced audit UX
+
+### Definition of Done
+
+P-VAULT is complete when:
+
+- a pentester can inspect credentials without exposing secrets by default;
+- Reveal is explicit, auditable and never changes compromise state;
+- credentials have a provenance-backed lifecycle;
+- the operator can mark a credential compromised or invalid;
+- strong authentication outcomes can produce state-transition proposals;
+- LLMs can reason over credential metadata without receiving raw secrets by default;
+- credential state changes are visible to hypotheses and strategy;
+- prior conclusions can be reopened when a new credential invalidates their assumptions;
+- reports can document credential exposure/validation/compromise with evidence references while masking secrets;
+- historical state remains reconstructable.
+
 ## P-FINAL — Live Investigation Report,,This is intentionally the **last product priority**. Reporting should consume the investigation model rather than becoming another source of truth.,,### Objective,,Add a dedicated **REPORT** tab to the TUI that continuously builds the final engagement report from the authoritative investigation state while the pentest is happening.,,The operator should be able to open the report at any point and see what the final deliverable would look like **right now**, without waiting for the engagement to finish.,,### Live report tab,,The new tab should present a continuously updated report draft with sections such as:,,- Executive Summary;,- Scope and Rules of Engagement;,- Attack Surface / Assets;,- Methodology and Coverage;,- Findings;,- Evidence and provenance;,- Validation / Exploitation evidence;,- Credentials and access obtained, with secrets masked by default;,- Attack paths / relationships;,- Timeline of relevant investigation events;,- Hypotheses tested and their final status;,- Actions performed and important failed attempts;,- Risk/impact context;,- Recommendations / remediation;,- Limitations and unresolved questions;,- Appendix / technical evidence references.,,The report should distinguish **confirmed findings**, **observations**, **hypotheses**, **operator notes** and **unresolved items**. A generated narrative must never silently turn an inference into a confirmed finding.,,### Real-time generation model,,Use the existing investigation state as the source of truth:,,`Event → Evidence → Observation → Entity/Relationship → Objective/Hypothesis → Action → Outcome → Report Section`,,Report generation should be incremental. A new validated observation should update only the affected report sections rather than regenerating the entire document unnecessarily.,,LLM narration may improve readability, executive summaries and technical explanations, but deterministic state and provenance must remain authoritative.,,### Export,,The operator should be able to export the current report at any moment and export the final version when the engagement is complete.,,Minimum export targets:,,- Markdown;,- HTML;,- PDF;,- JSON/structured report data for machine processing.,,Exported reports should include a generation timestamp and investigation/session identifier, preserve evidence references, and clearly identify sections that are incomplete or based on unresolved hypotheses.,,### Finalization,,Provide an explicit report finalization action that creates a stable report snapshot. After finalization, subsequent investigation changes should not silently modify that exported snapshot.,,Example workflow:,,```text,REPORT,  Live draft,      ↓,  Operator reviews,      ↓,  Export now (optional),      ↓,  Investigation continues,      ↓,  Finalize report,      ↓,  Immutable report snapshot,```,,### Pentester UX,,The report tab should not interrupt the terminal workflow. It should support:,,- live refresh;,- section navigation;,- finding/evidence drill-down;,- jump from a report statement to its provenance;,- visible incomplete/unresolved sections;,- export without ending the session;,- finalization only when the operator chooses it.,,### Definition of Done,,P-FINAL is complete when a pentester can start an engagement, work normally in the terminal, open REPORT at any point, see a coherent report generated from the current investigation state, trace statements back to evidence, export an intermediate version, continue working, and finally produce a stable final report without manually reconstructing the engagement history.,
 ## Most defensible positioning
 
