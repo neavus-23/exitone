@@ -108,6 +108,145 @@ Avoid turning ExitOne into:
 
 Those areas already have strong projects.
 
+## P0-1 — Stabilization and pentester-first hardening
+
+Before adding new research capabilities, stabilize the functionality that already exists and make the current workflow reliable enough for daily use by a pentester in 2026.
+
+This is intentionally the first priority. The objective is not to add more AI features; it is to make the existing investigation loop predictable, fast, observable and trustworthy.
+
+### P0-1.1 Functional stabilization
+
+Audit every currently exposed workflow end-to-end:
+
+- workspace/session creation and resume;
+- Control Console navigation and context stack;
+- TUI PTY lifecycle and shell interaction;
+- Zsh command/output capture;
+- manual and automatic ingestion;
+- deterministic parsers and generic extraction;
+- entity/relationship correlation;
+- objectives and objective paths;
+- hypotheses, contradiction handling and reopening;
+- candidate generation/ranking;
+- accept, action registration and action-event association;
+- outcome creation and state revision;
+- next, why, guide, ask, explain, resolve;
+- Graph, Vault and Chat views;
+- scope and focus behavior;
+- rabbit-hole detection;
+- report generation;
+- sensitive-data masking and history filtering.
+
+Every path should have deterministic regression tests for success, failure, cancellation, duplicate ingestion, stale state and restart/resume behavior.
+
+### P0-1.2 Fix correctness before intelligence
+
+Prioritize defects that can make ExitOne remember or recommend something incorrectly:
+
+1. duplicate events/evidence;
+2. incorrect action ↔ event association;
+3. stale candidate acceptance after state changes;
+4. incorrect hypothesis reopening;
+5. entity merge collisions;
+6. ambiguous provenance;
+7. parser false positives;
+8. parser failures that silently discard evidence;
+9. race conditions between ingestion and strategy jobs;
+10. TUI/PTY lifecycle leaks;
+11. inconsistent state after process restart;
+12. discrepancies between the canonical embedded schema and db/schema.sql.
+
+The invariant is:
+
+> ExitOne must never become more confident because its internal state became less correct.
+
+### P0-1.3 Pentester UX hardening
+
+Optimize the current workflow around how an experienced operator actually works:
+
+- suggestions must be visible without stealing terminal focus;
+- Ctrl+Space must remain instantaneous and must never execute;
+- commands should be copyable/editable before execution;
+- candidates should show intent → why now → expected evidence → risk → assumptions;
+- distinguish confirmed values from inferred values at every UI surface;
+- make failed attempts useful rather than visually noisy;
+- make already-tested information immediately discoverable;
+- allow fast drill-down from a candidate to its evidence and previous attempts;
+- keep the default OVERVIEW compact enough for an active terminal session;
+- preserve keyboard-first operation and minimize modal interaction;
+- make stale/reopened paths prominent but non-blocking;
+- keep Chat subordinate to structured investigation state rather than making it the primary interface.
+
+### P0-1.4 Investigation memory quality
+
+Validate that the existing memory model actually answers the pentester's most important questions:
+
+- What do I know?
+- How do I know it?
+- What have I already tried?
+- What failed?
+- What changed since then?
+- What assumptions were true when I made that decision?
+- What is still unknown?
+- Which previous conclusion is no longer safe to treat as closed?
+- Why is ExitOne suggesting this now?
+- What evidence would make this suggestion successful or irrelevant?
+
+If a workflow cannot answer these questions deterministically from stored state, fix that before adding another LLM capability.
+
+### P0-1.5 2026 pentesting coverage baseline
+
+Expand the current methodology and command registry around modern pentesting workflows, without turning ExitOne into a hard-coded attack playbook.
+
+Prioritize coverage for:
+
+- web/API reconnaissance and endpoint mapping;
+- authentication and authorization testing;
+- session/cookie/token analysis;
+- REST and GraphQL API patterns;
+- TLS/HTTP security metadata;
+- DNS and cloud-facing attack surface;
+- SMB/LDAP/Kerberos/WinRM/SSH;
+- identity and credential discovery;
+- file shares and secrets exposure;
+- container/Kubernetes/cloud identity surfaces;
+- common Active Directory investigation paths;
+- vulnerability validation and evidence collection;
+- post-access enumeration and privilege/access analysis;
+- AI-enabled application surfaces where relevant: prompt injection, indirect prompt injection, retrieval/tool boundaries and agent permissions.
+
+The goal is not to encode exploit recipes. The goal is to make methodology objectives, evidence types, command capabilities and provenance rich enough that ExitOne can reason across these surfaces.
+
+### P0-1.6 Safety and trust baseline
+
+The human execution boundary should be tested as a security invariant, not merely documented. Current 2026 guidance around autonomous pentesting emphasizes scope enforcement, human oversight, auditability and safe autonomy boundaries. This aligns with ExitOne's human-in-the-loop architecture. 
+
+Add regression tests proving that:
+
+- no candidate path can execute a target command implicitly;
+- LLM output cannot directly invoke the shell;
+- inferred parameters cannot silently become confirmed facts;
+- out-of-scope assets remain visible as exclusions;
+- stale candidates cannot bypass current scope/state;
+- sensitive credentials remain masked by default;
+- provenance survives LLM-assisted extraction;
+- all operator-approved actions remain auditable.
+
+### P0-1.7 Definition of Done
+
+P0-1 is complete only when:
+
+- the current major workflows have automated regression coverage;
+- known correctness bugs are closed or explicitly documented;
+- a fresh installation can reproduce the same core workflow reliably;
+- restart/resume preserves investigation state correctly;
+- a pentester can conduct a realistic lab engagement without falling back to manual bookkeeping for basic state reconstruction;
+- every suggestion has traceable evidence/objective/action basis;
+- no LLM-generated content can silently mutate authoritative investigation state;
+- performance remains responsive during active terminal use;
+- the current feature set is documented according to actual behavior, not intended behavior.
+
+P0-1 deliberately precedes the research-heavy P0 work below. Stabilize the instrument before measuring whether its intelligence is novel.
 ## What should be strengthened
 
 ### P0 — Make the investigation-state model measurable
