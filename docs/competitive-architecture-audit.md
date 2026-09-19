@@ -500,6 +500,183 @@ Validate schema/types, provider connectivity, model availability, capability com
 
 Configuration changes that affect investigation behavior should record timestamp, configuration key, safe previous/new values, operator/session context, provider/model identifier and optional change note. Secret values must never enter the audit trail.
 
+### Competitive redesign: CONFIG as an Engagement Control Plane
+
+The comparison changes the design recommendation. CONFIG should not become a generic "settings page". Shannon already combines configuration with authenticated testing, scope guidance, rules of engagement and report filtering; Strix exposes structured LLM/context/runtime settings and supports many providers through LiteLLM; PentAGI exposes provider profiles, per-agent model/runtime options, prompt management and provider tests in its web console. citeturn0search1turn0search2turn0search3turn0search6
+
+Therefore ExitOne should treat CONFIG as an **Engagement Control Plane** with two clearly separated layers:
+
+```
+CONFIG
+├── ENGAGEMENT
+│   ├── Scope
+│   ├── Rules of Engagement
+│   ├── Objectives
+│   ├── Constraints
+│   ├── Environment
+│   ├── Client Context
+│   ├── Pentester Notes
+│   ├── Assumptions
+│   └── Known Unknowns
+│
+├── AI
+│   ├── Providers
+│   ├── Models
+│   ├── Capability Routing
+│   ├── Context Policy
+│   ├── Fallbacks
+│   └── Model Tests
+│
+├── INVESTIGATION
+│   ├── Methodology
+│   ├── Candidate Ranking
+│   ├── Rabbit-hole Thresholds
+│   ├── Ingestion / Parsers
+│   └── Evidence Policy
+│
+├── INTERFACE
+│   ├── TUI
+│   ├── Capture
+│   ├── Notifications
+│   └── Report Preferences
+│
+└── SYSTEM
+    ├── Storage
+    ├── Logging
+    ├── Diagnostics
+    └── Security
+```
+
+### What ExitOne should borrow
+
+**From Shannon:** make engagement context a first-class configuration object rather than forcing the operator to reconstruct it through environment variables or scattered files. Its current configuration explicitly includes authenticated testing, scope guidance, rules of engagement and report filtering. citeturn0search1
+
+**From Strix:** separate LLM, context-window and runtime configuration, and use a provider abstraction rather than implementing every provider as a bespoke ExitOne subsystem. Strix currently uses LiteLLM's provider/model format and supports local OpenAI-compatible servers as well as many hosted providers. citeturn0search0turn0search6
+
+**From PentAGI:** provider profiles should include per-agent/model/runtime configuration and provider test actions. This maps well to ExitOne's capability-oriented routing such as Extraction, Strategy and Report. citeturn0search3turn0search10
+
+### What ExitOne should do differently
+
+Do **not** copy a large server-admin settings console. ExitOne is local, terminal-native and investigation-centric.
+
+The key object should be:
+
+`EngagementProfile`
+
+It should reference:
+
+`Scope + ROE + Objectives + Constraints + Context + AI Policy + Investigation Policy + Report Policy`
+
+A workspace/session then resolves an **Effective Configuration** from that profile plus explicit overrides.
+
+### Effective Configuration
+
+Every important setting should expose:
+
+`value + source + scope + last_changed + safe provenance`
+
+Example:
+
+```
+Strategy model       qwen-local-9b
+Source               Workspace override
+Context policy       Investigation-aware
+Scope                10.10.10.0/24 + app.example.com
+ROE                  Production-safe
+Rabbit-hole threshold 3 low-yield attempts
+```
+
+This is more useful to a pentester than simply showing a collection of editable fields.
+
+### AI Capability Router
+
+Instead of configuring only a single "default LLM", define logical capabilities:
+
+```
+Extraction      → local fast model
+Strategy        → reasoning model
+Guide           → local/fast model
+GraphRAG        → local model
+Report          → stronger narrative model
+Fallback        → secondary provider
+```
+
+The operator can change these mappings without changing the investigation itself. Shannon currently uses one model setting across the scan, while PentAGI supports more granular provider/agent configuration; ExitOne should adopt the latter concept but keep it tied to its smaller set of explicit cognitive capabilities. citeturn0search4turn0search10
+
+### Context Policy Editor
+
+Add a dedicated policy editor defining what each capability may consume:
+
+```
+Strategy:
+  ✓ scope
+  ✓ objectives
+  ✓ evidence
+  ✓ hypotheses
+  ✓ previous attempts
+  ✓ operator notes
+  ✗ raw secrets by default
+  ✗ unrelated workspace history
+
+Report:
+  ✓ validated findings
+  ✓ provenance
+  ✓ timeline
+  ✓ selected operator context
+  ✗ unresolved speculation as fact
+```
+
+This turns the user's request for "comments so the LLM has context" into a controlled architectural mechanism rather than a large prompt textbox.
+
+### Engagement Templates
+
+Add reusable local templates for common assessment types:
+
+- Web/API;
+- Internal network;
+- Active Directory;
+- External perimeter;
+- Cloud;
+- Mobile/API;
+- AI application assessment;
+- CTF/lab.
+
+Templates should populate defaults for methodology and context, but **never silently change scope or authorization**.
+
+### Import / Export
+
+An EngagementProfile should be exportable as a sanitized configuration package so an engagement can be reproduced on another ExitOne installation without exporting investigation evidence or secrets.
+
+Provide:
+
+`export config --sanitized`
+
+and a corresponding import workflow with validation and explicit confirmation.
+
+### Configuration snapshots
+
+Before a material configuration change, store a versioned snapshot. This allows ExitOne to answer:
+
+> "Which configuration and model policy were active when this candidate was generated?"
+
+That becomes particularly valuable for report reproducibility and research evaluation.
+
+### Revised P-CONFIG priority
+
+P-CONFIG should therefore be implemented in this order:
+
+1. **EngagementProfile + Effective Configuration**
+2. **Scope / ROE / constraints**
+3. **Pentester context and notes**
+4. **AI Capability Router**
+5. **Context Policy**
+6. **Provider/model CRUD and testing**
+7. **Investigation policy controls**
+8. **Interface/system settings**
+9. **Versioning, snapshots and sanitized import/export**
+
+This makes CONFIG a strategic part of ExitOne rather than a conventional settings menu.
+
 ### Definition of Done
 
 P-CONFIG is complete when an operator can manage ExitOne's supported configuration entirely from CONFIG, maintain multiple AI providers/models, assign them to logical capabilities, safely test and activate configurations, disable or remove them, understand the effective configuration and reproduce which provider/model configuration influenced an investigation decision.
