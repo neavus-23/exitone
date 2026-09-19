@@ -363,6 +363,99 @@ The TUI becomes:
 
 `OVERVIEW | GRAPH | VAULT | CHAT | REPORT | CONFIG`
 
+### Pentest engagement context
+
+CONFIG should also be the central place to define the contextual information that ExitOne uses throughout an investigation. This is not limited to technical application settings: it should capture the operator's explicit engagement context so recommendations are grounded in the actual assignment.
+
+Include, where applicable:
+
+- **Scope / Rules of Engagement** — in-scope assets, explicit exclusions, domains, IP ranges, applications, APIs, environments and permitted test windows;
+- **Engagement objectives** — what the pentester is expected to establish or validate;
+- **Testing constraints** — prohibited techniques, rate limits, production restrictions, authentication constraints and other operational boundaries;
+- **Environment context** — lab, staging, production or other environment classification;
+- **Known information** — information supplied by the client before testing;
+- **Pentester notes** — free-form comments, observations and working context supplied explicitly by the operator;
+- **Assumptions** — assumptions the operator wants ExitOne to consider until evidence confirms or disproves them;
+- **Known unknowns** — questions the operator already knows remain unresolved;
+- **Priority/focus** — explicit areas the operator wants investigated first;
+- **Client terminology** — application names, business functions, asset aliases and other vocabulary that improves correlation;
+- **Assessment metadata** — engagement name, assessment type, environment, dates, team/operator information and report metadata;
+- **Evidence handling preferences** — retention, redaction and reporting rules supported by the implementation.
+
+### Operator context versus evidence
+
+A critical distinction should be preserved:
+
+`Operator Context ≠ Evidence`
+
+A pentester comment such as “the client says this account should be disabled” is contextual information, not proof that the account is disabled. ExitOne may use it to formulate objectives, hypotheses or suggestions, but it must not silently promote it to an observed fact.
+
+Represent contextual inputs with explicit provenance and status, for example:
+
+`OPERATOR_NOTE → CONTEXT → HYPOTHESIS/OBJECTIVE → EVIDENCE → OBSERVATION`
+
+This allows the LLM to use the pentester's knowledge without contaminating the authoritative evidence graph.
+
+### Scope as a first-class control
+
+The existing scope model should be surfaced and expanded through CONFIG rather than requiring CLI-only management. The operator should be able to add, edit, disable and remove scope rules, including explicit exclusions.
+
+Scope should be evaluated before candidate presentation and remain visible in the investigation UI. An asset should not become in-scope merely because an LLM inferred a relationship to an in-scope asset.
+
+Where technically supported, scope entries should distinguish:
+
+- exact asset;
+- hostname/domain;
+- IP/CIDR;
+- URL/application/API;
+- wildcard/pattern;
+- explicit exclusion;
+- note/reason;
+- validity period.
+
+### LLM context policy
+
+CONFIG should provide a clear policy for which contextual information each AI capability receives.
+
+For example:
+
+`Strategy = scope + objectives + relevant evidence + hypotheses + operator context`
+
+`Report = investigation state + validated evidence + selected operator context`
+
+`Explain = methodology + relevant investigation state`
+
+The system should not blindly send all configuration or all notes to every model. Context should be resolved according to capability and least-necessary information.
+
+### Session context controls
+
+The operator should be able to distinguish:
+
+- **Persistent engagement context** — survives across sessions/workspace resume;
+- **Workspace context** — applies to a particular engagement/workspace;
+- **Session context** — applies only to the current run;
+- **Ephemeral note** — temporary working context that should not become part of the permanent investigation record.
+
+This prevents a temporary thought from becoming permanent institutional memory accidentally.
+
+### Context lifecycle
+
+Operator context should support:
+
+1. create;
+2. edit;
+3. pin/unpin;
+4. mark as resolved;
+5. supersede;
+6. archive;
+7. delete;
+8. inspect provenance;
+9. control which AI capabilities may consume it.
+
+### Definition of Done — context and scope
+
+This part of P-CONFIG is complete when a pentester can configure the engagement scope, exclusions, objectives, constraints, environment, notes, assumptions, known unknowns and other relevant context from CONFIG; ExitOne uses that information to improve investigation guidance; and the system still keeps operator-provided context clearly separated from authoritative evidence and observations.
+
 ### Configuration domains
 
 Expose supported configuration for AI/LLM providers, active and fallback models, local LLM endpoints, OpenAI-compatible endpoints, generation parameters, extraction, strategy, GraphRAG, guide/explain, command generation, parsers, ingestion, Zsh/tmux/PTY capture, workspace/session defaults, scope, candidate ranking, rabbit-hole thresholds, reporting, UI preferences, logging, storage and privacy/security.
