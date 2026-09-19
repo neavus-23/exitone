@@ -355,6 +355,64 @@ Example:
 
 The benchmark should assert state transitions and candidate-basis provenance, not exact LLM wording.
 
+## P-CONFIG — Configuration and AI Provider Control Center
+
+Add a dedicated **CONFIG** tab to the TUI so ExitOne's operational configuration can be inspected and changed without editing files manually.
+
+The TUI becomes:
+
+`OVERVIEW | GRAPH | VAULT | CHAT | REPORT | CONFIG`
+
+### Configuration domains
+
+Expose supported configuration for AI/LLM providers, active and fallback models, local LLM endpoints, OpenAI-compatible endpoints, generation parameters, extraction, strategy, GraphRAG, guide/explain, command generation, parsers, ingestion, Zsh/tmux/PTY capture, workspace/session defaults, scope, candidate ranking, rabbit-hole thresholds, reporting, UI preferences, logging, storage and privacy/security.
+
+Only settings actually supported by the current implementation should be active controls. Planned settings should be clearly marked as planned or disabled.
+
+### AI provider management
+
+Allow the operator to create, edit, duplicate, enable/disable, test, select, reorder and delete provider configurations. Support multiple independent providers, including local llama-server, Ollama and OpenAI-compatible/self-hosted endpoints, with room for additional adapters.
+
+Provider fields should include, where applicable: name, endpoint/base URL, model identifier, credential reference, connection mode, timeout, context window, generation parameters, enabled state, capabilities, priority and fallback eligibility.
+
+### Role-based model assignment
+
+Allow different models/providers to be assigned to logical ExitOne capabilities such as:
+
+`Extraction → Strategy → Guide → Explain → GraphRAG → Report`
+
+This allows lightweight local models to handle deterministic-adjacent tasks while stronger models can be assigned to reasoning or report narration, subject to implemented capabilities.
+
+### Configuration CRUD
+
+The operator should be able to create, edit, duplicate, enable/disable, test connectivity, test a model, assign capabilities, reorder priority, delete configurations and restore safe defaults. Destructive actions require confirmation.
+
+### Secrets
+
+API keys, tokens and other secrets must be masked by default, support controlled temporary reveal, never enter command history or ordinary logs, and never be included in prompts, reports or telemetry. Provider credentials should remain separate from investigation evidence so exported reports cannot accidentally contain them.
+
+### Configuration scope and provenance
+
+Support explicit configuration scope where implemented:
+
+`Global → Workspace → Session`
+
+The effective value should show its source, such as `workspace override` or `global default`. AI-assisted operations should be able to record the provider/model configuration that influenced them, without recording secrets.
+
+### Validation and safe activation
+
+Validate schema/types, provider connectivity, model availability, capability compatibility, timeouts, parameters, endpoint safety and required credentials before activation. A failed configuration test must not replace the currently working configuration.
+
+### Auditability
+
+Configuration changes that affect investigation behavior should record timestamp, configuration key, safe previous/new values, operator/session context, provider/model identifier and optional change note. Secret values must never enter the audit trail.
+
+### Definition of Done
+
+P-CONFIG is complete when an operator can manage ExitOne's supported configuration entirely from CONFIG, maintain multiple AI providers/models, assign them to logical capabilities, safely test and activate configurations, disable or remove them, understand the effective configuration and reproduce which provider/model configuration influenced an investigation decision.
+
+Configuration management remains separate from investigation evidence and must never provide a path for an LLM to execute shell commands or silently alter authoritative investigation state.
+
 ## P-FINAL — Live Investigation Report,,This is intentionally the **last product priority**. Reporting should consume the investigation model rather than becoming another source of truth.,,### Objective,,Add a dedicated **REPORT** tab to the TUI that continuously builds the final engagement report from the authoritative investigation state while the pentest is happening.,,The operator should be able to open the report at any point and see what the final deliverable would look like **right now**, without waiting for the engagement to finish.,,### Live report tab,,The new tab should present a continuously updated report draft with sections such as:,,- Executive Summary;,- Scope and Rules of Engagement;,- Attack Surface / Assets;,- Methodology and Coverage;,- Findings;,- Evidence and provenance;,- Validation / Exploitation evidence;,- Credentials and access obtained, with secrets masked by default;,- Attack paths / relationships;,- Timeline of relevant investigation events;,- Hypotheses tested and their final status;,- Actions performed and important failed attempts;,- Risk/impact context;,- Recommendations / remediation;,- Limitations and unresolved questions;,- Appendix / technical evidence references.,,The report should distinguish **confirmed findings**, **observations**, **hypotheses**, **operator notes** and **unresolved items**. A generated narrative must never silently turn an inference into a confirmed finding.,,### Real-time generation model,,Use the existing investigation state as the source of truth:,,`Event → Evidence → Observation → Entity/Relationship → Objective/Hypothesis → Action → Outcome → Report Section`,,Report generation should be incremental. A new validated observation should update only the affected report sections rather than regenerating the entire document unnecessarily.,,LLM narration may improve readability, executive summaries and technical explanations, but deterministic state and provenance must remain authoritative.,,### Export,,The operator should be able to export the current report at any moment and export the final version when the engagement is complete.,,Minimum export targets:,,- Markdown;,- HTML;,- PDF;,- JSON/structured report data for machine processing.,,Exported reports should include a generation timestamp and investigation/session identifier, preserve evidence references, and clearly identify sections that are incomplete or based on unresolved hypotheses.,,### Finalization,,Provide an explicit report finalization action that creates a stable report snapshot. After finalization, subsequent investigation changes should not silently modify that exported snapshot.,,Example workflow:,,```text,REPORT,  Live draft,      ↓,  Operator reviews,      ↓,  Export now (optional),      ↓,  Investigation continues,      ↓,  Finalize report,      ↓,  Immutable report snapshot,```,,### Pentester UX,,The report tab should not interrupt the terminal workflow. It should support:,,- live refresh;,- section navigation;,- finding/evidence drill-down;,- jump from a report statement to its provenance;,- visible incomplete/unresolved sections;,- export without ending the session;,- finalization only when the operator chooses it.,,### Definition of Done,,P-FINAL is complete when a pentester can start an engagement, work normally in the terminal, open REPORT at any point, see a coherent report generated from the current investigation state, trace statements back to evidence, export an intermediate version, continue working, and finally produce a stable final report without manually reconstructing the engagement history.,
 ## Most defensible positioning
 
