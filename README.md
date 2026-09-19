@@ -41,6 +41,45 @@ ExitOne sits between those two approaches:
 
 ---
 
+## Pentester-first UX
+
+ExitOne is designed so the investigation model stays mostly **behind the interface**.
+
+The normal workflow is intentionally small:
+
+```text
+START → WORK → NOTICE → DECIDE → EXECUTE → CONTINUE
+```
+
+The terminal remains the primary workspace. ExitOne automatically captures and correlates evidence while the right-side investigation rail surfaces only:
+
+- current state;
+- the best next action;
+- why it matters;
+- important state changes or reopened paths.
+
+Advanced surfaces such as Graph, Vault, Report, Replay and Config are inspection/control views, not mandatory investigation stages.
+
+The operator should not have to manually maintain candidates, hypotheses, outcomes or report records during normal testing. Those are internal investigation objects. The expected interaction is:
+
+```text
+Ctrl+Space → insert next suggestion
+Enter       → operator executes
+ExitOne     → captures result and updates state
+Ctrl+W      → understand why
+Ctrl+A      → inspect alternatives
+Ctrl+G      → ask for guidance
+```
+
+The UX goal is simple:
+
+> **Use the terminal normally. ExitOne remembers what happened, tells you what changed, and puts the next useful option in front of you.**
+
+See [docs/pentester-ux-audit.md](docs/pentester-ux-audit.md) for the competitive UX analysis and redesign.
+
+
+---
+
 ## Architecture
 
 ```mermaid
